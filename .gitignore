@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+
+# Local secrets: never commit. Copy .env.example instead.
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+
+# Personal Claude Code settings
+.claude/settings.local.json
