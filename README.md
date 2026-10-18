@@ -9,7 +9,7 @@ catalog and the schedule, and see occupancy and revenue reports.
 can take about a minute). Demo login: `user@example.com` / `user-password`.
 
 Built as a learning project, phase by phase: [PLAN.md](PLAN.md) is the roadmap and [IMPLEMENTATION.md](IMPLEMENTATION.md)
-explains every step and decision. The original brief is in [specs.md](specs.md).
+explains every step and decision. The original brief is in [SPECS.md](SPECS.md).
 
 ## Highlights
 

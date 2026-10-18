@@ -1,6 +1,6 @@
 # Movie Reservation System: Learning Plan
 
-A step-by-step plan for building the backend in `specs.md` yourself. Each phase has
+A step-by-step plan for building the backend in `SPECS.md` yourself. Each phase has
 **what you learn**, **what you build**, a **done when** checklist, and **self-check questions**.
 Don't move on until you can answer the questions without looking anything up.
 
