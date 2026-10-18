@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { timeZoneSchema } from "../../lib/schemas.ts";
 
 const showtimeFields = {
   movieId: z.number().int().positive(),
@@ -17,5 +18,12 @@ export const updateShowtimeBody = z
   .partial()
   .refine((body) => Object.keys(body).length > 0, { message: "Provide at least one field to update" });
 
+// ?date=2026-10-20 (a calendar day, no time) and optionally &tz=Europe/Madrid.
+export const scheduleQuery = z.object({
+  date: z.iso.date(),
+  tz: timeZoneSchema.optional(),
+});
+
 export type CreateShowtimeInput = z.output<typeof createShowtimeBody>;
 export type UpdateShowtimeInput = z.output<typeof updateShowtimeBody>;
+export type ScheduleQuery = z.output<typeof scheduleQuery>;

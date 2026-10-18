@@ -1,16 +1,19 @@
-import { eq } from "drizzle-orm";
+import { and, asc, eq, gt, gte, lt, sql } from "drizzle-orm";
+import { env } from "../../config/env.ts";
 import { db } from "../../db/client.ts";
-import { halls, movies, reservations, showtimes } from "../../db/schema.ts";
+import { halls, movies, reservationSeats, reservations, seats, showtimes } from "../../db/schema.ts";
 import {
   ConflictError,
   isPgError,
   NotFoundError,
   PG_EXCLUSION_VIOLATION,
   PG_FOREIGN_KEY_VIOLATION,
+  PG_INVALID_PARAMETER_VALUE,
   ValidationError,
 } from "../../lib/errors.ts";
+import { genresByMovie } from "../movies/movies.service.ts";
 import { computeEndsAt } from "./schedule.ts";
-import type { CreateShowtimeInput, UpdateShowtimeInput } from "./showtimes.schemas.ts";
+import type { CreateShowtimeInput, ScheduleQuery, UpdateShowtimeInput } from "./showtimes.schemas.ts";
 
 type Executor = Pick<typeof db, "select">;
 
@@ -132,4 +135,80 @@ export async function deleteShowtime(id: number) {
     }
     throw err;
   }
+}
+
+// --- Browsing (public) ---
+
+// Movies with their upcoming showtimes on one calendar day, in the given timezone.
+export async function getDaySchedule({ date, tz = env.THEATER_TIMEZONE }: ScheduleQuery) {
+  // Where the day starts and ends, as UTC instants. "timestamp AT TIME ZONE tz" reads
+  // a local wall-clock time in that zone. Postgres does the math, so a day with a
+  // daylight-saving change is correctly 23 or 25 hours long.
+  const dayStart = sql`(${date}::date)::timestamp at time zone ${tz}`;
+  const dayEnd = sql`(${date}::date + 1)::timestamp at time zone ${tz}`;
+
+  // Free seats = seats in the hall - active bookings for this showtime.
+  // Correlated subqueries: each one runs once per showtime row.
+  const seatsAvailable = sql<number>`(
+    (select count(*) from ${seats} where ${seats.hallId} = ${showtimes.hallId})
+    - (select count(*) from ${reservationSeats}
+       where ${reservationSeats.showtimeId} = ${showtimes.id} and ${reservationSeats.active})
+  )`.mapWith(Number);
+
+  const rows = await db
+    .select({
+      movie: {
+        id: movies.id,
+        title: movies.title,
+        description: movies.description,
+        posterUrl: movies.posterUrl,
+        durationMinutes: movies.durationMinutes,
+      },
+      showtime: {
+        id: showtimes.id,
+        startsAt: showtimes.startsAt,
+        endsAt: showtimes.endsAt,
+        priceCents: showtimes.priceCents,
+        seatsAvailable,
+      },
+      hall: { id: halls.id, name: halls.name },
+    })
+    .from(showtimes)
+    .innerJoin(movies, eq(movies.id, showtimes.movieId))
+    .innerJoin(halls, eq(halls.id, showtimes.hallId))
+    .where(
+      and(
+        // A range on starts_at (not "date(starts_at) = ..."), so the index can be used.
+        gte(showtimes.startsAt, dayStart),
+        lt(showtimes.startsAt, dayEnd),
+        // Only showtimes you can still book.
+        gt(showtimes.startsAt, sql`now()`),
+      ),
+    )
+    .orderBy(asc(movies.title), asc(movies.id), asc(showtimes.startsAt))
+    .catch((err: unknown) => {
+      // Intl and Postgres don't know exactly the same zone names; if Postgres
+      // rejects one that Intl accepted, it's still the client's input.
+      if (isPgError(err, PG_INVALID_PARAMETER_VALUE)) {
+        throw new ValidationError([{ path: "query.tz", message: `Unknown timezone: ${tz}` }]);
+      }
+      throw err;
+    });
+
+  // The query returns one row per showtime; nest them under their movie.
+  type MovieRow = (typeof rows)[number]["movie"];
+  type ShowtimeRow = (typeof rows)[number]["showtime"] & { hall: (typeof rows)[number]["hall"] };
+  const byMovie = new Map<number, MovieRow & { showtimes: ShowtimeRow[] }>();
+  for (const { movie, showtime, hall } of rows) {
+    const entry = byMovie.get(movie.id) ?? { ...movie, showtimes: [] };
+    entry.showtimes.push({ ...showtime, hall });
+    byMovie.set(movie.id, entry);
+  }
+
+  const genres = await genresByMovie([...byMovie.keys()]);
+  return {
+    date,
+    timezone: tz,
+    movies: [...byMovie.values()].map((m) => ({ ...m, genres: genres.get(m.id) ?? [] })),
+  };
 }

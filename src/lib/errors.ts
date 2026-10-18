@@ -52,6 +52,7 @@ export class ConflictError extends AppError {
 export const PG_FOREIGN_KEY_VIOLATION = "23503";
 export const PG_UNIQUE_VIOLATION = "23505";
 export const PG_EXCLUSION_VIOLATION = "23P01";
+export const PG_INVALID_PARAMETER_VALUE = "22023";
 
 // Drizzle wraps driver errors in a DrizzleQueryError, with the original
 // Postgres error (which has the code) in `cause`. This checks both levels.

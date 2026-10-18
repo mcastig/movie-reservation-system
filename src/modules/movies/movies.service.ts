@@ -16,7 +16,7 @@ type Genre = { id: number; name: string };
 
 // Loads the genres of many movies in ONE query, instead of one query per movie
 // (the "N+1 queries" problem), and groups them by movie id.
-async function genresByMovie(movieIds: number[]) {
+export async function genresByMovie(movieIds: number[]) {
   const byMovie = new Map<number, Genre[]>();
   if (movieIds.length === 0) return byMovie;
 
