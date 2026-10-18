@@ -62,4 +62,6 @@ Run lint, typecheck and tests before every commit.
 - `.env` (local) and `.env.neon` (the production Neon database) hold secrets. Never commit them, print them, or echo
   passwords into the chat. `npm run db:seed` wipes the target database: never run it against Neon without explicit approval.
 - Production: Render service `movie-reservation-api` (https://movie-reservation-api-q5am.onrender.com), database on Neon
-  (Postgres 18). `TRUST_PROXY_HOPS` is not verified yet: the rate limiter still sees a different key per request on Render.
+  (Postgres 18). `TRUST_PROXY_HOPS=3` was measured on Render (Cloudflare, Render's load balancer, a local proxy); if the
+  rate limiter's `pk=` key changes between requests from one client, re-measure instead of guessing (IMPLEMENTATION.md,
+  Phase 10, Step 9).
