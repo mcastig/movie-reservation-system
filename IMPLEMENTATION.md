@@ -2009,3 +2009,161 @@ Checked by hand: the development and production log formats above, and that the 
 
 A production Docker image for the API, GitHub Actions running typecheck and tests on every push, and deploying with the database on Neon,
 including `trust proxy` and HTTPS.
+
+---
+
+## Phase 10: Docker, CI and deploy 🚧
+
+**Goal:** the same code that passes the tests on your laptop is built into an image, checked automatically on every push, and
+served from a public URL with a hosted database.
+
+Status: the image, Compose, CI and the deploy config are done and verified locally. The deploy itself (Neon + Render) needs your
+accounts, so it's the last step below.
+
+### Files created or changed
+
+```
+Dockerfile                    # two stages: production dependencies, then the runtime image
+.dockerignore                 # keeps .env, .git, tests and node_modules out of the build
+docker-compose.yml            # + the "api" service, built from the Dockerfile
+.github/workflows/ci.yml      # lint, typecheck and tests (with Postgres) + docker build, on every push
+render.yaml                   # Render Blueprint: the deploy settings as code
+biome.json                    # linter config
+src/db/migrate.ts             # applies migrations with drizzle-orm (no dev tools needed)
+src/config/env.ts             # + TRUST_PROXY_HOPS
+src/app.ts                    # app.set("trust proxy", ...), as a createApp option
+package.json                  # + lint; start and db:migrate use plain node; db:up starts only db; engines >=24
+tests/integration/hardening.test.ts  # + 2 tests for X-Forwarded-For
+```
+
+### Step 1: no build step (Node runs TypeScript)
+
+Node 24 runs `.ts` files directly by **stripping the types**: it blanks out the annotations and runs what's left as JavaScript.
+That only works for TypeScript that is "JavaScript plus types". Features that generate code (enums, parameter properties,
+namespaces) can't be stripped, and that's exactly what `erasableSyntaxOnly` in `tsconfig.json` forbids. It's been on since Phase 0,
+which pays off here:
+
+```bash
+node src/server.ts     # no tsx, no tsc, no dist/ folder
+```
+
+`tsx` stays for development (it adds `watch`). `npm start` and the container use plain `node`. Type *checking* is still `tsc`'s
+job, in CI. Stripping doesn't check anything.
+
+### Step 2: migrations without drizzle-kit (`src/db/migrate.ts`)
+
+`drizzle-kit` is a dev dependency, and the production image has no dev dependencies. The migrations are just the SQL files in
+`drizzle/` plus a journal, and `drizzle-orm` (a runtime dependency) can apply them. The test setup already did that in Phase 8.
+`npm run db:migrate` now uses this script too, so dev, tests and production run migrations the same way.
+
+It's safe to run on every start: Drizzle records applied files in `drizzle.__drizzle_migrations` and skips them.
+
+### Step 3: the Dockerfile
+
+```dockerfile
+FROM node:24-alpine AS deps          # stage 1
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev                # production dependencies only
+
+FROM node:24-alpine AS runtime       # stage 2: a fresh image
+COPY --from=deps /app/node_modules ./node_modules
+COPY src ./src
+COPY drizzle ./drizzle
+USER node
+CMD ["sh", "-c", "node src/db/migrate.ts && exec node src/server.ts"]
+```
+
+| Decision | Why |
+|----------|-----|
+| **Two stages** | The final image keeps only what it copies. Build leftovers (npm cache, package metadata) stay in stage 1 |
+| **Package files copied before the code** | Docker caches each step. A code change reuses the cached `npm ci` layer, so rebuilds take seconds |
+| **`npm ci --omit=dev`** | Exact lockfile versions, no tsx/vitest/typescript/drizzle-kit/biome. `node_modules` is **51 MB in the image vs 217 MB locally** |
+| **`alpine`** | A small base image. argon2 ships prebuilt binaries for Alpine (musl), so nothing is compiled |
+| **`.dockerignore`** | `.env` (secrets!) and `.git` never reach the build, and the build context stays small |
+| **`USER node`** | Not root. If the process is ever compromised, it can't change the image's files |
+| **Migrate, then start** | Each deploy upgrades the schema before the new code serves requests. If a migration fails, the container exits and the platform keeps the old version running |
+| **`exec node ...`** | Replaces the shell, so Node is PID 1 and receives `SIGTERM`. Without `exec`, `sh` gets the signal, ignores it, and Docker kills everything after 10 s, dropping in-flight requests |
+
+### Step 4: `docker compose up` runs everything
+
+`docker-compose.yml` gets an `api` service built from the Dockerfile. Two Compose ideas:
+
+- **Service names are hostnames.** Inside Compose's network the API reaches Postgres at `db:5432`, not `localhost`: in a
+  container, `localhost` is the container itself.
+- **`depends_on: condition: service_healthy`** waits for Postgres's healthcheck, not just for its container to exist.
+
+The API is published on **8080** so it doesn't clash with `npm run dev` on 3000. `JWT_SECRET: ${JWT_SECRET:?...}` is read from your
+`.env`, and Compose refuses to start if it's missing. `npm run db:up` now starts only `db`, so day-to-day work doesn't build the image.
+
+### Step 5: linting with Biome
+
+The plan asks for lint in CI. **Biome** is one dependency with no plugins, and it doesn't depend on the TypeScript compiler (we use
+TypeScript 7). Only the linter is on; the formatter would rewrite every file. The first run found 20 warnings:
+
+| Rule | Count | Decision |
+|------|-------|----------|
+| `useImportType` | 1 | **Real.** `tokens.ts` imported `db` only for `typeof db`; now `import type`, so loading tokens.ts no longer opens a DB pool |
+| `noExplicitAny` | 4 | Deliberate (`AnyHandler` in auth.ts, explained in Phase 5). Silenced with a `biome-ignore` comment that gives the reason |
+| `noNonNullAssertion` | 15 | Turned off. With `noUncheckedIndexedAccess`, `rows[0]!` after an insert that must return a row is our normal style |
+
+### Step 6: GitHub Actions (`.github/workflows/ci.yml`)
+
+Two jobs run in parallel on every push to `main` and every pull request:
+
+1. **check**: `npm ci` → `npm run lint` → `npm run typecheck` → `npm test`. A **service container** runs `postgres:17-alpine`
+   next to the job, with the same user and password as docker-compose. So `tests/test-env.ts`'s default URL
+   (`localhost:5432/movies_test`) works unchanged, and the global setup creates and migrates the test database.
+2. **docker**: `docker build`, so a broken Dockerfile shows up in CI, not in the deploy.
+
+`concurrency` cancels an older run when you push again to the same branch. `cache: npm` reuses downloaded packages.
+
+### Step 7: `trust proxy` (production config)
+
+On a hosting platform, requests reach the app through the platform's proxy. The TCP connection comes from the proxy, and the
+client's real IP is in the `X-Forwarded-For` header. That breaks the rate limiter either way:
+
+| Setting | Behind a proxy | Without a proxy |
+|---------|----------------|-----------------|
+| Trust nobody (default) | Every user has the proxy's IP, so **all users share one budget** | ✅ Correct, and a fake `X-Forwarded-For` is ignored |
+| Trust everything | ✅ | **Anyone can fake a new IP** with each request and never be limited |
+| Trust exactly N hops | ✅ The address added by our N proxies | (not used) |
+
+So `TRUST_PROXY_HOPS` defaults to 0, and the deploy sets it to 1. The two new tests check both rows of the table.
+
+### Step 8: deploy (Neon + Render)
+
+`render.yaml` describes the service: Docker runtime, free plan, health check on `/health`, deploy only when CI passes
+(`autoDeployTrigger: checksPass`), and environment variables. `DATABASE_URL` is `sync: false` (you paste it into the dashboard, so
+it's never in git) and `JWT_SECRET` is generated by Render.
+
+1. **Neon:** create a project (Postgres 17), copy the connection string with **connection pooling off** (one small server
+   doesn't need PgBouncer). It ends in `?sslmode=require`: the database is on the internet, so the connection is encrypted.
+2. **Render:** New → Blueprint → this repo. Paste `DATABASE_URL`. The first deploy builds the image, runs the 3 migrations
+   against Neon, and starts the server.
+3. **Sample data:** halls and seats only come from the seed (there's no halls API). For this demo, seed Neon once from your
+   laptop: `DATABASE_URL="<neon url>" SEED_ADMIN_PASSWORD="<a strong password>" npm run db:seed`. ⚠️ The seed wipes the
+   database. That's fine for a demo, never for real users.
+4. **Done when:** `https://<service>.onrender.com/health` returns `{"status":"ok"}` and `/docs` loads.
+
+Render's free plan sleeps after 15 minutes without traffic. The first request after that takes about a minute.
+HTTPS comes from Render, which terminates TLS at its proxy. HSTS (from helmet, Phase 9) then tells browsers to always use it.
+
+### Verification (local)
+
+| Check | Result |
+|-------|--------|
+| `node src/server.ts` (no tsx) serves `/health` and `/movies` | ✅ |
+| `npm run db:migrate` (new script) on the existing dev database | ✅ "Migrations are up to date" |
+| `docker build` | ✅ 70 MB compressed; no dev tools in `node_modules` |
+| `docker compose up -d --build api` → `:8080/health` 200, `/movies` 200, `/docs/` 200 | ✅ |
+| In the container: runs as `node`; migrations then server; server is PID 1; logs are JSON | ✅ |
+| `docker compose stop api` | ✅ 0.2 s, "SIGTERM received", exit code 0 |
+| `npm run lint`, `npm run typecheck`, `npm test` | ✅ 98 tests (2 new) |
+
+### Try it yourself (practice)
+
+1. Remove `exec` from the Dockerfile's `CMD`, rebuild, and time `docker compose stop api`. Does the log still say "SIGTERM received"? Explain what you see.
+2. Move `COPY src ./src` above `RUN npm ci`, change one line of code, and rebuild twice. Watch which steps say `CACHED`.
+3. Break a test on a branch, open a pull request, and watch CI turn red. Does Render deploy it?
+4. Run `docker run --rm movies-api ls node_modules | wc -l` and compare with your local `node_modules`.
+5. Add a step to CI that runs `npm audit --omit=dev --audit-level=high`. What should happen when it finds something?
