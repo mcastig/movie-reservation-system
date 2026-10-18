@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import { errorHandler, notFound } from "./middleware/errorHandler.ts";
 import { genresRouter } from "./modules/genres/genres.routes.ts";
+import { moviesRouter } from "./modules/movies/movies.routes.ts";
 
 // Builds the Express app without starting a server,
 // so tests can import it and send requests directly.
@@ -13,6 +14,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/genres", genresRouter);
+app.use("/movies", moviesRouter);
 
 // Order matters: these run only if nothing above sent a response.
 app.use(notFound);
