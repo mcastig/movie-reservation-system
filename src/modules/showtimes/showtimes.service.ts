@@ -212,3 +212,48 @@ export async function getDaySchedule({ date, tz = env.THEATER_TIMEZONE }: Schedu
     movies: [...byMovie.values()].map((m) => ({ ...m, genres: genres.get(m.id) ?? [] })),
   };
 }
+
+// Every seat in the showtime's hall, each marked available or not.
+export async function getSeatMap(id: number) {
+  const showtime = await getShowtime(id);
+
+  // The booking conditions go in the JOIN's ON clause, not in WHERE. With LEFT JOIN,
+  // a seat with no matching booking still appears (with NULLs). A WHERE on
+  // reservation_seats columns would drop those rows: exactly the free seats.
+  const rows = await db
+    .select({
+      id: seats.id,
+      rowLabel: seats.rowLabel,
+      seatNumber: seats.seatNumber,
+      available: sql<boolean>`${reservationSeats.seatId} is null`,
+    })
+    .from(seats)
+    .leftJoin(
+      reservationSeats,
+      and(
+        eq(reservationSeats.seatId, seats.id),
+        eq(reservationSeats.showtimeId, id),
+        eq(reservationSeats.active, true),
+      ),
+    )
+    .where(eq(seats.hallId, showtime.hall.id))
+    .orderBy(asc(seats.rowLabel), asc(seats.seatNumber));
+
+  // Group into rows (A, B, C...) so a client can draw the map directly.
+  const seatRows: { row: string; seats: { id: number; number: number; available: boolean }[] }[] = [];
+  for (const seat of rows) {
+    let row = seatRows.at(-1);
+    if (row?.row !== seat.rowLabel) {
+      row = { row: seat.rowLabel, seats: [] };
+      seatRows.push(row);
+    }
+    row.seats.push({ id: seat.id, number: seat.seatNumber, available: seat.available });
+  }
+
+  return {
+    showtime,
+    totalSeats: rows.length,
+    availableSeats: rows.filter((s) => s.available).length,
+    rows: seatRows,
+  };
+}

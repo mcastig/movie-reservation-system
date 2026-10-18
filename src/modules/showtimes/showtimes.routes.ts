@@ -11,6 +11,10 @@ showtimesRouter.get("/:id", validate({ params: idParams }), async (req, res) => 
   res.json(await showtimesService.getShowtime(req.params.id));
 });
 
+showtimesRouter.get("/:id/seats", validate({ params: idParams }), async (req, res) => {
+  res.json(await showtimesService.getSeatMap(req.params.id));
+});
+
 showtimesRouter.post(
   "/",
   authenticate,
