@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { env } from "../../config/env.ts";
-import { db } from "../../db/client.ts";
+import type { db } from "../../db/client.ts";
 import { refreshTokens, userRole } from "../../db/schema.ts";
 
 export type AuthUser = { id: number; role: (typeof userRole.enumValues)[number] };

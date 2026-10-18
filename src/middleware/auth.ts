@@ -6,6 +6,7 @@ import { type AuthUser, verifyAccessToken } from "../modules/auth/tokens.ts";
 // These middlewares only read headers and req.user, so they accept any
 // params/body/query types. That lets them sit in front of validate() without
 // TypeScript forcing the route's params back to plain strings.
+// biome-ignore lint/suspicious/noExplicitAny: deliberate, see the comment above.
 type AnyHandler = RequestHandler<any, any, any, any>;
 
 // Adds `req.user` to Express's Request type for every file in the project.
