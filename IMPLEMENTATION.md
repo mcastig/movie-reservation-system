@@ -8,7 +8,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 
 - [x] Phase 0: Foundations and setup
 - [x] Phase 1: Data modeling
-- [ ] Phase 2: Movies and genres CRUD
+- [x] Phase 2: Movies and genres CRUD
 - [ ] Phase 3: Authentication and authorization
 - [ ] Phase 4: Showtimes and scheduling
 - [ ] Phase 5: Browsing and seat availability
@@ -423,7 +423,228 @@ or someone typing SQL by hand. The `if` is still useful for a friendly error mes
    Then delete the generated file and its snapshot/journal entry. You'll do changes like this for real later.
 4. What would break if `reservation_seats` had no `hall_id` column? Try writing the bad insert from the table above without it.
 
-### Next: Phase 2, movies and genres CRUD
+---
 
-Endpoints to list, create, update and delete movies and genres (no auth yet), with Zod validation
-for request bodies, a central error handler, and the routes → service → database layering.
+## Phase 2: Movies and genres CRUD ✅
+
+**Goal:** the first real endpoints, with every request validated and every error returned in one consistent
+JSON shape. No auth yet: anyone can write (Phase 3 locks the write endpoints to admins).
+
+### Files created
+
+```
+.
+├── requests.http                 # sample requests for VS Code REST Client / Bruno / Postman
+└── src/
+    ├── app.ts                    # now mounts the routers + notFound + errorHandler
+    ├── lib/
+    │   ├── errors.ts             # AppError and friends, isPgError()
+    │   └── schemas.ts            # shared Zod pieces: id params, pagination
+    ├── middleware/
+    │   ├── validate.ts           # validate({ params, query, body })
+    │   └── errorHandler.ts       # notFound + errorHandler
+    └── modules/
+        ├── genres/               # genres.routes.ts, genres.service.ts, genres.schemas.ts
+        └── movies/               # movies.routes.ts, movies.service.ts, movies.schemas.ts
+```
+
+### Endpoints
+
+| Method | Path | Success | Errors |
+|--------|------|---------|--------|
+| `GET` | `/genres` | 200, array sorted by name | |
+| `POST` | `/genres` | 201, the new genre | 400 invalid, 409 `GENRE_EXISTS` |
+| `GET` | `/movies?page=&limit=&genre=` | 200, `{ data, pagination }` | 400 invalid query |
+| `GET` | `/movies/:id` | 200, the movie with its genres | 400 bad id, 404 |
+| `POST` | `/movies` | 201 + `Location` header | 400 invalid / unknown genre |
+| `PATCH` | `/movies/:id` | 200, the updated movie | 400, 404 |
+| `DELETE` | `/movies/:id` | 204, no body | 404, 409 `MOVIE_HAS_SHOWTIMES` |
+| *anything else* | | | 404 `NOT_FOUND` |
+
+A movie looks like this (`genres` is always included):
+
+```json
+{ "id": 1, "title": "Inception", "description": "...", "posterUrl": "https://...",
+  "durationMinutes": 148, "createdAt": "2026-10-18T00:09:26.741Z",
+  "genres": [{ "id": 1, "name": "Action" }, { "id": 4, "name": "Sci-Fi" }] }
+```
+
+### Step 1: the layering (routes → service → database)
+
+```
+HTTP request
+  → validate()                 checks params/query/body, or calls next(ValidationError)
+  → route handler              reads the parsed input, calls the service, picks the status code
+  → service                    business rules + Drizzle queries; throws AppErrors
+  → errorHandler               turns any thrown error into { error: { code, message } }
+```
+
+- **Routes** know HTTP (status codes, headers) but no SQL.
+- **Services** know the rules and the database but nothing about `req`/`res`. They can be reused by other
+  services or tested without a server.
+- In this small app the service also runs the queries. A separate "repository" layer can come later if a service grows.
+
+**Express 5 catches async errors.** If an `async` handler throws (or a promise rejects), Express 5 passes
+the error to the error handler by itself. Express 4 needed a wrapper like `asyncHandler()` or a `try/catch`
+in every route, otherwise the request would hang.
+
+### Step 2: `src/lib/errors.ts`
+
+```ts
+throw new NotFoundError(`Movie ${id} not found`);       // → 404 NOT_FOUND
+throw new ConflictError("GENRE_EXISTS", "...");          // → 409 GENRE_EXISTS
+throw new ValidationError([{ path, message }]);          // → 400 VALIDATION_ERROR + details
+```
+
+All of them extend `AppError`, which carries `status`, `code` and an optional `details`.
+The **`code`** is for programs (a frontend can `switch` on `GENRE_EXISTS`); the **`message`** is for humans and may change.
+
+The classes declare their fields explicitly instead of using `constructor(readonly status: number)`.
+That shorthand ("parameter properties") generates extra JavaScript, which `erasableSyntaxOnly` in `tsconfig.json` forbids.
+
+**`isPgError(err, code)`**: Drizzle wraps driver errors in a `DrizzleQueryError` and puts the real Postgres error
+(the one with `code: "23505"`) in `err.cause`. This was found by probing:
+`DrizzleQueryError | code: undefined | cause: DatabaseError 23503`. So the helper walks the `cause` chain.
+
+### Step 3: `src/middleware/validate.ts`
+
+```ts
+moviesRouter.patch("/:id", validate({ params: idParams, body: updateMovieBody }), async (req, res) => {
+  req.params.id   // number, not string
+  req.body.title  // string | undefined
+});
+```
+
+- It validates all three parts and reports **every** problem in one response, not just the first.
+- On success it **replaces** each part with Zod's output: `"42"` becomes `42`, strings are trimmed,
+  defaults like `page = 1` are filled in.
+- **Types flow through.** `validate()` returns a `RequestHandler` whose generics are the schemas' output types,
+  and TypeScript gives the next handler the same types. This was checked with a throwaway file where
+  `const a: string = req.params.id` failed to compile.
+- **The Express 5 gotcha:** `req.query` is now a getter, so `req.query = parsed` throws.
+  `Object.defineProperty(req, "query", { value })` defines an own property on that request, which hides the getter.
+
+### Step 4: `src/middleware/errorHandler.ts`
+
+Express recognizes an error handler because it has **four** parameters `(err, req, res, next)`.
+It's registered last in `app.ts`, after `notFound`, which turns any unmatched route into a 404.
+
+What it does with each kind of error:
+
+| Error | Response |
+|-------|----------|
+| `AppError` (ours) | its own status, code, message, details |
+| `express.json()` couldn't parse the body | 400 `INVALID_JSON` |
+| Other 4xx from Express/body-parser (e.g. 413 body too large) | that status, `BAD_REQUEST` |
+| Postgres unique / FK violation that no service translated | 409 `CONFLICT` (safety net) |
+| Anything else | logged with `console.error`; client gets 500 `INTERNAL_ERROR` with **no details** |
+
+Never send stack traces or SQL errors to clients. They help attackers and confuse users.
+
+### Step 5: Zod schemas
+
+| Choice | Why |
+|--------|-----|
+| `z.strictObject` for bodies | `{ "nmae": "X" }` gives `Unrecognized key: "nmae"` instead of being silently dropped. |
+| `.trim()` on strings | `"  Thriller "` is stored as `"Thriller"`, and `"   "` fails `min(1)`. |
+| `z.coerce.number()` for params and query | They're always strings in the URL. Bodies are JSON, so they use plain `z.number()`: `"116"` (a string) is rejected there. |
+| `z.url({ protocol: /^https?$/ })` | Accepts only http(s) URLs, so `javascript:alert(1)` is rejected. |
+| `genreIds` deduplicated with `.transform` | `[4, 3, 4]` → `[4, 3]`; a duplicate would break the `movie_genres` primary key. |
+| `.partial()` + `.refine()` for PATCH | Every field optional, but `{}` is a 400: an empty update is almost always a client bug. |
+| `limit` max 100 | So nobody can ask for a million rows in one request. |
+
+### Step 6: the services
+
+**Genres: insert first, translate the error.** `createGenre` doesn't check "does this name exist?" first.
+Two requests could both pass that check (the race from the Phase 1 self-check). It inserts, and if the
+unique constraint fires, it throws `ConflictError("GENRE_EXISTS")`.
+
+**Movies: list with pagination and genre filter.**
+
+```ts
+const [rows, total] = await Promise.all([pageQuery, db.$count(movies, where)]);
+```
+
+- **Offset pagination:** `LIMIT 20 OFFSET (page - 1) * 20`. Simple, and lets you jump to page 7. (On huge tables
+  big offsets get slow; *cursor* pagination fixes that. Not needed here.)
+- **Stable order:** `ORDER BY title, id`. Without the `id` tie-breaker, two movies with the same title could swap
+  between pages.
+- **The genre filter uses `EXISTS`**, not a `JOIN`. A join to `movie_genres` would return a movie once per
+  matching row, which breaks counts and pages.
+- The page query and the count run **in parallel** with `Promise.all`.
+
+**Avoiding N+1 queries.** Listing 20 movies and then fetching genres for each one is 1 + 20 queries.
+`genresByMovie()` loads the genres for **all** listed movies in one query (`WHERE movie_id IN (...)`) and groups them
+in a `Map`. Always 2 queries, whatever the page size.
+
+**Create and update use a transaction**, so a movie is never saved without its genres (or the other way round).
+`genreIds` in a PATCH **replaces** the whole list: the service deletes the movie's `movie_genres` rows and
+inserts the new ones. Leaving `genreIds` out keeps the current genres.
+
+**Unknown genre ids are checked explicitly.** The foreign key would reject them too, but its error can't say
+*which* ids are wrong. `assertGenresExist` returns `Unknown genre id(s): 99`.
+
+**Delete rule (self-check question):** *a movie with any showtimes, past or future, can't be deleted.*
+Past showtimes hold reservation and revenue history, and future ones hold bookings people paid for.
+The database already enforces this (`ON DELETE RESTRICT` from Phase 1). The service tries the delete and turns
+the FK violation into `409 MOVIE_HAS_SHOWTIMES`. To remove such a movie, delete its showtimes first (Phase 4 rules apply).
+
+### Verification (Phase 2 "done when")
+
+`npm run typecheck` passes. Then every endpoint was called with `curl` against a freshly seeded database:
+
+| Request | Result |
+|---------|--------|
+| `GET /genres` | ✅ 200, 5 genres sorted by name |
+| `POST /genres {"name":"  Thriller "}` | ✅ 201, stored as `"Thriller"` |
+| `POST /genres` same name again | ✅ 409 `GENRE_EXISTS` |
+| `POST /genres {"nmae":"X"}` | ✅ 400, two details: `name` missing, `nmae` unrecognized |
+| `GET /movies?limit=2` | ✅ 200, 2 movies with genres, `total: 3, totalPages: 2` |
+| `GET /movies?genre=5` | ✅ 200, only *Spirited Away* |
+| `GET /movies?page=0&limit=500&genre=abc` | ✅ 400, three details at once |
+| `GET /movies/2` / `999` / `abc` | ✅ 200 / 404 / 400 |
+| `POST /movies` valid, `genreIds: [4,3,4]` | ✅ 201, `Location: /movies/4`, 2 genres (duplicate removed) |
+| `POST /movies` with `javascript:` URL, empty title, negative duration | ✅ 400, every field reported |
+| `POST /movies` with `genreIds: [1, 99]` | ✅ 400 `Unknown genre id(s): 99` |
+| `POST /movies` with malformed JSON | ✅ 400 `INVALID_JSON` |
+| `PATCH /movies/4` title + genres | ✅ 200, genres replaced |
+| `PATCH /movies/4 {}` / `PATCH /movies/999` | ✅ 400 / 404 |
+| `DELETE /movies/1` (has showtimes) | ✅ 409 `MOVIE_HAS_SHOWTIMES` |
+| `DELETE /movies/4`, then again | ✅ 204, then 404 |
+| `GET /nope` | ✅ 404 JSON (Phase 0's HTML 404 is gone) |
+
+To try them yourself: `npm run dev`, then open `requests.http` with the VS Code **REST Client** extension
+(or use `curl` / Bruno / Postman). Run `npm run db:seed` afterwards to reset the data.
+
+### Self-check answers
+
+<details>
+<summary>Why use <code>PATCH</code> and not <code>PUT</code> for partial updates?</summary>
+
+`PUT` means "replace the resource with this": the client sends the **whole** movie, and a missing field means
+"clear it". `PATCH` means "change only these fields". To rename a movie with `PUT` you'd have to resend the description,
+duration, poster and genres too, and if two people edit different fields at the same time, the second `PUT` silently
+undoes the first one's change. `PATCH { "title": "..." }` touches only the title.
+</details>
+
+<details>
+<summary>What should <code>DELETE /movies/:id</code> do if the movie has future showtimes with reservations?</summary>
+
+Here: **refuse with 409.** Deleting it would cancel paid bookings without telling anyone and erase revenue history.
+The admin must handle the showtimes first (cancel them and notify users, Phase 4/6).
+Other valid rules exist: a *soft delete* (`archived_at` column, hidden from listings, history kept) is common in
+real systems. What matters is picking one rule and having the database enforce it.
+</details>
+
+### Try it yourself (practice)
+
+1. Add `GET /genres/:id/movies` that reuses `listMovies({ genre: id, ... })`.
+2. Make `POST /genres` treat `"action"` and `"Action"` as duplicates. (Hint: a unique index on `lower(name)` and a migration, like `users.email`.)
+3. Add `DELETE /genres/:id`. What happens to `movie_genres` rows? (Check the FK's `onDelete` in `schema.ts`.)
+4. Add a `?search=` query param that matches titles with `ilike`. What happens if someone sends `%`?
+5. Throw `new Error("boom")` in a route and call it. Check that the client gets a plain 500 and the terminal shows the stack.
+
+### Next: Phase 3, authentication and authorization
+
+Sign up and log in with argon2-hashed passwords, JWT access and refresh tokens, `authenticate` and
+`requireRole("admin")` middleware, and locking the Phase 2 write endpoints to admins.
