@@ -14,7 +14,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 5: Browsing and seat availability
 - [x] Phase 6: Reservations
 - [x] Phase 7: Admin reporting
-- [ ] Phase 8: Testing
+- [x] Phase 8: Testing
 - [ ] Phase 9: Hardening
 - [ ] Phase 10: Docker, CI and deploy
 - [ ] Phase 11: Extensions
@@ -29,6 +29,7 @@ npm run db:migrate        # creates the tables
 npm run db:seed           # wipes and fills the tables with sample data
 npm run dev               # API on http://localhost:3000, restarts on file changes
 curl localhost:3000/health
+npm test                  # 84 tests; creates and migrates a separate movies_test database
 ```
 
 | Script | What it does |
@@ -41,6 +42,9 @@ curl localhost:3000/health
 | `npm run db:migrate` | Applies migrations that haven't run yet |
 | `npm run db:seed` | Wipes every table and inserts sample data (refuses in production) |
 | `npm run db:studio` | Opens Drizzle Studio, a browser GUI for the database |
+| `npm test` | Runs every unit and integration test once (`vitest run`) |
+| `npm run test:watch` | Re-runs tests as you edit files |
+| `npm run test:unit` | Only the unit tests (no database needed) |
 | `npm run race` | The Phase 6 concurrency experiment: 20 simultaneous bookings for one seat (API must be running) |
 
 ---
@@ -1641,7 +1645,163 @@ counting the full price.
 4. Add a "top 3 showtimes by occupancy" to the showtimes report with `ORDER BY ... LIMIT 3`.
 5. Add `?sort=` to `/admin/reports/movies` (`revenue`, `tickets`, `title`). How do you allow it without building SQL from user input?
 
-### Next: Phase 8, testing
+---
 
-Turn the manual checks from Phases 2–7 into automated tests: unit tests for the rules, Supertest integration tests against a separate
-test database, and the concurrency experiment as a test. Done when `npm test` is green.
+## Phase 8: Testing ✅
+
+**Goal:** the checks done by hand in Phases 2–7 run automatically with one command, against a real Postgres database
+that's separate from the one you develop with.
+
+```
+$ npm test
+ Test Files  10 passed (10)
+      Tests  84 passed (84)
+   Duration  7.79s
+```
+
+### Files created or changed
+
+```
+.
+├── vitest.config.ts                    # two projects: unit and integration
+├── tests/
+│   ├── test-env.ts                     # test env vars + the "_test" safety check
+│   ├── unit/                           # no database
+│   │   ├── rules.test.ts               # price, cancel rule, ends_at
+│   │   ├── schemas.test.ts             # Zod schemas: normalization, strict keys, timezones...
+│   │   └── errors.test.ts              # isPgError and Drizzle's wrapper
+│   └── integration/                    # real HTTP + real Postgres
+│       ├── global-setup.ts             # once: create movies_test if needed, run migrations
+│       ├── setup.ts                    # each file: reseed before every test, close the pool at the end
+│       ├── helpers.ts                  # api(), tokens, seat ids, dates, raw SQL
+│       ├── catalog.test.ts             # Phase 2
+│       ├── auth.test.ts                # Phase 3
+│       ├── showtimes.test.ts           # Phase 4
+│       ├── browse.test.ts              # Phase 5
+│       ├── reservations.test.ts        # Phase 6
+│       ├── concurrency.test.ts         # Phase 6's race experiment
+│       └── reports.test.ts             # Phase 7
+└── src/
+    ├── db/fixtures.ts                  # seedDatabase(): the seed as a reusable function
+    ├── db/seed.ts                      # now a small CLI wrapper around seedDatabase()
+    └── modules/reservations/rules.ts   # reservationTotal(), assertCancellable(): pure functions
+```
+
+### Step 1: dependencies
+
+```bash
+npm install -D vitest supertest @types/supertest
+```
+
+| Package | Role |
+|---------|------|
+| `vitest` | The test runner: `describe`, `it`, `expect`, hooks, watch mode. Runs TypeScript directly. |
+| `supertest` | Sends HTTP requests to the Express `app` object without starting a server on a fixed port. |
+
+Vitest 5 was new, so before writing the config its type definitions were checked for every option used
+(`projects`, `fileParallelism`, `globalSetup`, `setupFiles`, `env`, `hookTimeout`).
+
+### Step 2: the test pyramid here
+
+| Layer | What | How many | Speed | Needs Postgres |
+|-------|------|----------|-------|----------------|
+| **Unit** | Pure functions and Zod schemas | 27 | ~0.4 s for all | No |
+| **Integration** | Real HTTP requests → routes → services → real database | 57 | ~7 s for all | Yes |
+
+The pyramid says to have many fast unit tests and fewer slow integration tests. This project is mostly *rules enforced by the
+database* (constraints, locks, SQL reports), which a unit test can't check, so integration tests carry more of the weight than usual.
+That's a deliberate choice: mocking the database would test a fake that doesn't have the unique index.
+
+**Extracting pure rules.** The plan asks for unit tests of "price calculation" and "can cancel?". Both were inline in the service, mixed with
+queries, so they moved to `src/modules/reservations/rules.ts`:
+
+```ts
+reservationTotal(priceCents, seatCount)               // throws RangeError for nonsense input
+assertCancellable({ status, startsAt }, now = new Date())  // throws ConflictError
+```
+
+`now` is a **parameter**, so a test can choose the time and check the exact boundary ("starts right now" counts as started)
+without waiting or mocking the clock. The service calls them, so the tested code is the code that runs.
+
+### Step 3: a separate test database
+
+- **`movies_test`** lives in the same Postgres container as `movies`. Tests wipe it before every test, so it must never be the dev database.
+- **`vitest.config.ts` sets `test.env`**, so `src/config/env.ts` reads `DATABASE_URL=.../movies_test` and a test `JWT_SECRET`, not your `.env`.
+- **Safety check:** both the global setup and each test file refuse to run unless the database name ends in `_test`.
+- **Global setup** (once per run, in the main Vitest process): connects to the built-in `postgres` database, runs `CREATE DATABASE movies_test`
+  if it doesn't exist, then applies `drizzle/` with Drizzle's `migrate()`. It's the same migrations as `npm run db:migrate`, so the test schema is
+  the real schema, constraints and all.
+- **`fileParallelism: false`**: one shared database means test files must run one after another. (Per-worker databases would allow parallel
+  files; not needed at 8 seconds.)
+
+Verified after the full run: the dev database still had exactly the seed's 1 reservation and its unique index.
+
+### Step 4: fixtures (the seed, reused)
+
+The seed moved into `seedDatabase()` (`src/db/fixtures.ts`). `npm run db:seed` and the tests both call it, so
+**tests run against exactly the data you've been exploring by hand**: showtime 1 is Inception at 14:00 tomorrow in Hall 1,
+seat 9 is B1, the demo user owns reservation 1, and so on. `helpers.ts` documents that layout and has `seatId(1, "B1")` and `utcAt(1, "14:00")`.
+
+`setup.ts` runs `seedDatabase()` **before every test**. It truncates every table with `RESTART IDENTITY`, so ids start at 1 again, and each
+test is independent of the others and of their order.
+
+argon2 is slow on purpose, so `seedDatabase` caches the two password hashes per process (`hashOnce`). Without that, every test would pay for
+hashing them again.
+
+### Step 5: integration tests with Supertest
+
+```ts
+const res = await api().post("/reservations").set(bearer(token)).send({ showtimeId: 1, seatIds: [9, 10] }).expect(201);
+expect(res.body).toMatchObject({ status: "confirmed", totalCents: 2400 });
+```
+
+`api()` is `request(app)`. This is the payoff of Phase 0's split: `app.ts` never calls `listen()`, so Supertest can start the app on a random
+port per request. The tests go through the whole stack: JSON parsing, auth middleware, Zod, services, Postgres constraints, the error handler.
+
+For things the API can't do on purpose (a showtime in the past, a reservation inserted "by hand"), `helpers.ts` runs SQL directly with `query(sql\`...\`)`.
+
+**The concurrency test** starts one real server (`app.listen(0)`) and sends 20, then 50, simultaneous `fetch` requests for the same seat,
+just like `scripts/race.ts`. It asserts **exactly one 201**, the rest 409, and exactly one active row in the database.
+
+### Step 6: do the tests actually catch bugs?
+
+A test suite that has never failed hasn't proven anything. So the code was broken on purpose, one bug at a time, and the suite run again:
+
+| Deliberate bug | Caught by |
+|----------------|-----------|
+| `reservationTotal` charges one extra cent | 4 tests (2 unit, 2 integration) |
+| `requireRole("admin")` removed from `POST /movies` | `auth.test.ts`: the 401/403/201 test |
+| The showtimes report counts cancelled seats as revenue | `reports.test.ts`: per-showtime numbers |
+| `assertCancellable` allows past showtimes | 3 tests (2 unit, 1 integration) |
+| **Unique index dropped** in `movies_test` | `concurrency.test.ts`: `expected [201, 201, …] to have a length of 1 but got 20` (and 50) |
+
+After each one, the code (or the index) was restored and `npm test` was green again. Recreating the index hit the Phase 6 lesson once more:
+the last test had left duplicate rows behind, so they had to be cleared first.
+
+**If the test database ever gets into a bad state**, drop it and let the next run rebuild it:
+`docker compose exec db dropdb -U movies movies_test`.
+
+### Coverage of each phase's "done when"
+
+| Phase | "Done when" | Test |
+|-------|-------------|------|
+| 2 | Create, list, edit, delete movies; bad input is a 400 with a clear message | `catalog.test.ts` |
+| 3 | No token → 401, regular user → 403, admin succeeds | `auth.test.ts` › protected writes |
+| 4 | Overlap in the same hall → 409, different halls allowed | `showtimes.test.ts` › creating showtimes |
+| 5 | The seat map changes after a reservation is inserted by hand | `browse.test.ts` › seat map |
+| 6 | The race experiment passes; cancelling a past reservation is a 409 | `concurrency.test.ts`, `reservations.test.ts` › cancelling |
+| 7 | Report numbers match a hand calculation | `reports.test.ts` |
+
+### Try it yourself (practice)
+
+1. Run `npm run test:watch`, open `src/modules/reservations/rules.ts`, and change the cancel rule. Watch the tests react as you save.
+2. Write a test for practice exercise 3 of Phase 5 (moving `showtime_id = 1` from `ON` to `WHERE`): which assertion would catch it?
+3. Add a test that a regular user gets **403** on every admin route. Can you loop over a list of routes with `it.each`?
+4. Measure coverage: `npm install -D @vitest/coverage-v8` and run `npx vitest run --coverage`. Which lines are never executed?
+   Is 100% worth it?
+5. Make a test fail on purpose, then read Vitest's diff output. Then make a *test* wrong (not the code) and see how that looks.
+
+### Next: Phase 9, hardening
+
+`helmet` security headers, `cors` with an allow-list, rate limiting on `/auth/*`, request logging with pino (with a request id),
+an OpenAPI spec with Swagger UI at `/docs`, and a review of every endpoint: is input validated, is ownership checked, does it leak data?
