@@ -193,6 +193,21 @@ Content-Type: application/json
 DELETE {{base}}/showtimes/1
 Authorization: {{admin}}
 
+### --- Admin reports (send "Log in as admin" first) ---
+# from/to filter on when the SHOW starts: from inclusive, to exclusive, with a timezone.
+
+### Every reservation, filtered and paginated
+GET {{base}}/admin/reservations?status=confirmed&page=1&limit=20
+Authorization: {{admin}}
+
+### Per showtime: capacity, tickets sold, occupancy, revenue (cancelled seats don't count)
+GET {{base}}/admin/reports/showtimes?from=2026-10-19T00:00:00Z&to=2026-10-20T00:00:00Z
+Authorization: {{admin}}
+
+### Per movie: revenue and tickets (movies with no showtimes in the range show zeros)
+GET {{base}}/admin/reports/movies
+Authorization: {{admin}}
+
 ### --- Errors to try ---
 
 ### 400: several validation problems at once
