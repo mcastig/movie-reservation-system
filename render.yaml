@@ -1,0 +1,28 @@
+# Render Blueprint: the deploy configuration as code. In the Render dashboard,
+# New > Blueprint > pick this repo, and Render creates the service described here.
+# The database lives on Neon, so it isn't declared here.
+services:
+  - type: web
+    name: movie-reservation-api
+    # Build the Dockerfile in this repo; its CMD runs the migrations, then the server.
+    runtime: docker
+    plan: free
+    region: oregon
+    # Render polls this; a deploy only goes live once the new container answers 200,
+    # so a version that crashes on startup never replaces the working one.
+    healthCheckPath: /health
+    # Deploy a new commit on main only after its GitHub checks (our CI) pass.
+    autoDeployTrigger: checksPass
+    envVars:
+      # Neon's connection string. sync: false means "ask for it in the dashboard",
+      # so the secret never lives in git.
+      - key: DATABASE_URL
+        sync: false
+      # Render generates a random value once and keeps it.
+      - key: JWT_SECRET
+        generateValue: true
+      # Render's proxy sits in front of the app (see TRUST_PROXY_HOPS in src/config/env.ts).
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      - key: THEATER_TIMEZONE
+        value: UTC
