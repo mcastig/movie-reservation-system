@@ -1,6 +1,7 @@
 import { hash } from "argon2";
 import { sql } from "drizzle-orm";
 import { env } from "../config/env.ts";
+import { computeEndsAt } from "../modules/showtimes/schedule.ts";
 import { db, pool } from "./client.ts";
 import {
   genres,
@@ -25,7 +26,6 @@ const adminEmail = process.env.SEED_ADMIN_EMAIL ?? "admin@example.com";
 const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? "admin-password";
 
 const HOUR = 60 * 60 * 1000;
-const MINUTE = 60 * 1000;
 
 // Tomorrow at 00:00 UTC, so showtimes are always in the future when you seed.
 const now = new Date();
@@ -125,7 +125,7 @@ await db.transaction(async (tx) => {
     )
     .returning();
 
-  // Three days of showtimes. ends_at = starts_at + duration, and the times are
+  // Three days of showtimes. ends_at = starts_at + duration + cleaning buffer, and the times are
   // spaced so no two showtimes overlap in the same hall.
   const schedule = [
     { movie: inception, hall: hall1!, hourUtc: 14, priceCents: 1200 },
@@ -143,7 +143,7 @@ await db.transaction(async (tx) => {
             movieId: movie.id,
             hallId: hall.id,
             startsAt,
-            endsAt: new Date(startsAt.getTime() + movie.durationMinutes * MINUTE),
+            endsAt: computeEndsAt(startsAt, movie.durationMinutes),
             priceCents,
           };
         }),

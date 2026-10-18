@@ -11,6 +11,8 @@ const envSchema = z.object({
   // Short-lived access tokens limit the damage if one leaks; refresh tokens renew them.
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(15 * 60),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
+  // Time to clean a hall between two showtimes; added to every showtime's ends_at.
+  CLEANING_BUFFER_MINUTES: z.coerce.number().int().min(0).default(15),
 });
 
 const parsed = envSchema.safeParse(process.env);
