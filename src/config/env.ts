@@ -16,6 +16,7 @@ const envSchema = z.object({
   CLEANING_BUFFER_MINUTES: z.coerce.number().int().min(0).default(15),
   // IANA name of the cinema's timezone. Decides what "showtimes on 2026-10-20" means.
   THEATER_TIMEZONE: timeZoneSchema.default("UTC"),
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
 const parsed = envSchema.safeParse(process.env);

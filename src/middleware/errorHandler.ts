@@ -18,7 +18,7 @@ function send(res: Response, status: number, code: string, message: string, deta
 }
 
 // Express recognizes an error handler by its four parameters (err, req, res, next).
-export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
+export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   // Too late to send a JSON error; let Express close the connection.
   if (res.headersSent) return next(err);
 
@@ -45,7 +45,8 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
     return send(res, 409, "CONFLICT", "This change conflicts with related records");
   }
 
-  // Anything else is a bug. Log the details, but never send them to the client.
-  console.error(err);
-  send(res, 500, "INTERNAL_ERROR", "Something went wrong");
+  // Anything else is a bug. Log the details (req.log includes the request id), but
+  // never send them to the client. The client gets the id to quote in a bug report.
+  req.log.error({ err }, "Unhandled error");
+  res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Something went wrong", requestId: req.id } });
 };

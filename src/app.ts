@@ -1,5 +1,6 @@
 import express, { type Express } from "express";
 import { errorHandler, notFound } from "./middleware/errorHandler.ts";
+import { requestLogger } from "./middleware/requestLogger.ts";
 import { adminRouter } from "./modules/admin/admin.routes.ts";
 import { authRouter } from "./modules/auth/auth.routes.ts";
 import { genresRouter } from "./modules/genres/genres.routes.ts";
@@ -12,6 +13,8 @@ import { meRouter, usersRouter } from "./modules/users/users.routes.ts";
 // so tests can import it and send requests directly.
 const app: Express = express();
 
+// First, so every request gets an id and a log line.
+app.use(requestLogger);
 app.use(express.json());
 
 app.get("/health", (_req, res) => {

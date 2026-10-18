@@ -12,6 +12,8 @@ export const testEnv = {
   JWT_SECRET: "test-only-secret-that-is-at-least-32-characters",
   THEATER_TIMEZONE: "UTC",
   CLEANING_BUFFER_MINUTES: "15",
+  // Quiet output during tests.
+  LOG_LEVEL: "silent",
 };
 
 export function assertTestDatabase(url: string) {
