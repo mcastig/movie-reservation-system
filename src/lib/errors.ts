@@ -22,6 +22,20 @@ export class ValidationError extends AppError {
   }
 }
 
+// 401: "we don't know who you are" (no token, bad token, wrong password).
+export class UnauthorizedError extends AppError {
+  constructor(code: string, message: string) {
+    super(401, code, message);
+  }
+}
+
+// 403: "we know who you are, and you may not do this".
+export class ForbiddenError extends AppError {
+  constructor(message: string, code = "FORBIDDEN") {
+    super(403, code, message);
+  }
+}
+
 export class NotFoundError extends AppError {
   constructor(message: string) {
     super(404, "NOT_FOUND", message);
