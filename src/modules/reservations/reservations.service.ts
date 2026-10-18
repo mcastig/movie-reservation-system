@@ -11,6 +11,7 @@ import {
 import { type Pagination, paginate } from "../../lib/schemas.ts";
 import type { AuthUser } from "../auth/tokens.ts";
 import type { AdminReservationsQuery, CreateReservationInput } from "./reservations.schemas.ts";
+import { assertCancellable, reservationTotal } from "./rules.ts";
 
 // --- Reading ---
 
@@ -167,7 +168,7 @@ export async function createReservation(user: AuthUser, { showtimeId, seatIds }:
       //    4. The total comes from the database's price, never from the client.
       const [reservation] = await tx
         .insert(reservations)
-        .values({ userId: user.id, showtimeId, totalCents: showtime.priceCents * seatIds.length })
+        .values({ userId: user.id, showtimeId, totalCents: reservationTotal(showtime.priceCents, seatIds.length) })
         .returning({ id: reservations.id });
       await tx.insert(reservationSeats).values(
         seatIds.map((seatId) => ({
@@ -228,12 +229,7 @@ export async function cancelReservation(user: AuthUser, id: number) {
       .for("update", { of: reservations });
 
     if (!reservation) throw new NotFoundError(`Reservation ${id} not found`);
-    if (reservation.status === "cancelled") {
-      throw new ConflictError("ALREADY_CANCELLED", "This reservation is already cancelled");
-    }
-    if (reservation.startsAt.getTime() <= Date.now()) {
-      throw new ConflictError("SHOWTIME_STARTED", "Only upcoming reservations can be cancelled");
-    }
+    assertCancellable(reservation);
 
     await tx
       .update(reservations)
