@@ -12,7 +12,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 3: Authentication and authorization
 - [x] Phase 4: Showtimes and scheduling
 - [x] Phase 5: Browsing and seat availability
-- [ ] Phase 6: Reservations
+- [x] Phase 6: Reservations
 - [ ] Phase 7: Admin reporting
 - [ ] Phase 8: Testing
 - [ ] Phase 9: Hardening
@@ -41,6 +41,7 @@ curl localhost:3000/health
 | `npm run db:migrate` | Applies migrations that haven't run yet |
 | `npm run db:seed` | Wipes every table and inserts sample data (refuses in production) |
 | `npm run db:studio` | Opens Drizzle Studio, a browser GUI for the database |
+| `npm run race` | The Phase 6 concurrency experiment: 20 simultaneous bookings for one seat (API must be running) |
 
 ---
 
@@ -1252,7 +1253,212 @@ so test with realistic data sizes before adding indexes.
 4. Set `THEATER_TIMEZONE=America/Mexico_City` and restart. Which date do the seeded 14:00Z showtimes now belong to? And with `Pacific/Auckland`?
 5. Add a `?date=today` shortcut. Why is "today" itself timezone-dependent?
 
-### Next: Phase 6, reservations ⭐
+---
 
-`POST /reservations` in one transaction, letting the partial unique index reject a double booking (`23505` → 409), `GET /reservations/me`,
-cancelling (only your own, only upcoming), and the concurrency experiment: 20 simultaneous requests for one seat, exactly 1 winner.
+## Phase 6: Reservations ⭐ ✅
+
+**Goal:** logged-in users can book seats, see their reservations and cancel upcoming ones, and **a seat can never be sold twice**,
+no matter how many requests arrive at the same moment.
+
+### Files created or changed
+
+```
+.
+├── scripts/race.ts                      # the concurrency experiment (npm run race)
+├── tsconfig.json                        # now also type-checks scripts/
+└── src/modules/reservations/
+    ├── reservations.schemas.ts
+    ├── reservations.service.ts
+    └── reservations.routes.ts
+```
+
+### Endpoints (all need a logged-in user)
+
+| Method | Path | Success | Errors |
+|--------|------|---------|--------|
+| `POST` | `/reservations` | 201 + `Location` | 400, 409 `SEATS_TAKEN` / `SHOWTIME_STARTED` |
+| `GET` | `/reservations/me?page=&limit=` | 200, `{ data, pagination }` | 400 |
+| `GET` | `/reservations/:id` | 200 (yours; admins see all) | 404 |
+| `POST` | `/reservations/:id/cancel` | 200, the cancelled reservation | 404, 409 `ALREADY_CANCELLED` / `SHOWTIME_STARTED` |
+
+```json
+POST /reservations   { "showtimeId": 1, "seatIds": [9, 10] }
+→ 201
+{ "id": 2, "userId": 2, "status": "confirmed", "totalCents": 2400, "createdAt": "...", "cancelledAt": null,
+  "showtime": { "id": 1, "startsAt": "2026-10-19T14:00:00.000Z", "endsAt": "...",
+                "movie": { "id": 1, "title": "Inception" }, "hall": { "id": 1, "name": "Hall 1" } },
+  "seats": [ { "id": 9, "row": "B", "number": 1, "priceCents": 1200 },
+             { "id": 10, "row": "B", "number": 2, "priceCents": 1200 } ] }
+```
+
+### Step 1: booking in one transaction
+
+`createReservation` follows the plan's four steps inside **one** `db.transaction`:
+
+1. **The showtime exists and hasn't started**, read with `SELECT ... FOR SHARE`.
+2. **Every seat is in that showtime's hall.** The composite FK from Phase 1 would reject a wrong seat too, but this check can
+   say *which* ids are wrong.
+3. **Insert the reservation and its seat rows.** There's deliberately **no "are these seats free?" query** before the insert.
+4. **The total is computed from the database's price** (`priceCents × seats`). The body is a `strictObject`, so sending
+   `totalCents` is a 400. The client can't even suggest a price.
+
+If the partial unique index fires during step 3, Postgres raises `23505`, the **whole transaction rolls back** (the
+`reservations` row too), and the service returns `409 SEATS_TAKEN: Seat(s) already taken: A1, B2`. The list of taken seats
+comes from a second query *after* the failure. It's only for the message, not part of the guarantee.
+
+Verified: after 7 failed booking attempts in a row (taken seats, wrong hall, unknown showtime...), the `reservations` table still had only the
+2 successful rows. Nothing was left half-written.
+
+**Why `FOR SHARE` on the showtime?** Many bookings for the same showtime should run at the same time, and `FOR SHARE` locks are compatible
+with each other. But they conflict with Phase 4's `FOR UPDATE` and with a plain `UPDATE` of the price. So while bookings are in progress,
+an admin's price or time change waits, and the other way round. The price a customer is charged is always the current one.
+
+### Step 2: the concurrency experiment
+
+`scripts/race.ts` logs in, then sends N bookings for the **same seat** with `Promise.all` (all requests start before any is awaited):
+
+```
+$ npm run race
+Sending 20 simultaneous requests for seat 21 at showtime 2...
+Done in 34 ms:
+  201 OK                   × 1
+  409 SEATS_TAKEN          × 19
+✅ Exactly one booking succeeded.
+
+$ npm run race -- --requests 50 --seat 22
+  201 OK                   × 1
+  409 SEATS_TAKEN          × 49
+```
+
+Then, **with the index dropped** (`drop index reservation_seats_one_active_per_seat`):
+
+```
+Sending 20 simultaneous requests for seat 23 at showtime 2...
+  201 OK                   × 20
+❌ 20 bookings succeeded for one seat: overbooking!
+```
+
+`select count(*) ... where seat_id = 23 and active` returned **20**: twenty paying customers for one seat.
+
+Putting it back taught one more lesson. `CREATE UNIQUE INDEX` **failed** with `Key (showtime_id, seat_id)=(2, 23) is duplicated`.
+Postgres won't create a constraint that the existing data already breaks. In production, a missing constraint means
+cleaning up bad data before you can add the constraint back. The index was recreated after `npm run db:seed`, with the exact SQL
+from migration `0000`, and the experiment passed again.
+
+**What happens inside Postgres:** the first insert writes its index entry. The other 19 find a matching entry from a
+transaction that hasn't committed yet, so they **wait**. When the first one commits, they all fail with `23505`. (If it had rolled back,
+one of the waiting ones would have won instead.) The pool has 10 connections, so at most 10 transactions run at once and the rest queue,
+but that doesn't change the result.
+
+**Why not "check, then insert"?** `SELECT ... WHERE seat is free` and then `INSERT` has a gap between the two statements. Under load, several
+requests can all see "free" before any inserts, which is exactly the overbooking above. A check gives a nicer error message, but only
+a constraint gives the guarantee.
+
+### Step 3: reading reservations
+
+- `findReservations()` loads the reservations with their showtime, movie and hall in one query, then **all their seats in one more**:
+  2 queries in total (the same trick as `genresByMovie`).
+- Seats show the `priceCents` **copied at booking time**. Verified: after an admin raised showtime 1's price to 2000, Bob's reservation
+  still showed 1200.
+- **Someone else's reservation is a 404, not a 403.** A 403 would confirm "reservation 42 exists, it's just not yours". Admins can see every
+  reservation (useful for support and Phase 7).
+- `/reservations/me` is registered **before** `/:id` (the route-order lesson from Phase 5).
+- `reservationsRouter.use(authenticate)` protects every route in the router at once.
+
+### Step 4: cancelling
+
+Rules: **only the owner**, **only while confirmed**, **only before the showtime starts**.
+
+```ts
+select ... from reservations join showtimes ... where id = $1 and user_id = $me  for update of reservations
+→ not found? 404 · already cancelled? 409 · started? 409
+update reservations set status = 'cancelled', cancelled_at = now()
+update reservation_seats set active = false        -- frees the seats (the partial index ignores inactive rows)
+```
+
+- **`POST /:id/cancel`, not `DELETE`**: the reservation isn't deleted. Its row stays as history (for the user, and for revenue reports),
+  and only its state changes.
+- **`FOR UPDATE OF reservations`** locks only the reservation row, not the joined showtime. Two cancels of the same reservation run one
+  after the other, so the second one sees `cancelled` and gets a 409.
+- Both updates are in one transaction, so a reservation is never "cancelled" with its seats still blocked (or the other way round).
+- The `CHECK` from Phase 1 (`cancelled_at` set exactly when `status = 'cancelled'`) would catch a bug that set only one of them.
+
+### Verification (Phase 6 "done when")
+
+`npm run typecheck` passes. Against a freshly seeded database (the seed books A1 and A2 at showtime 1):
+
+| Scenario | Result |
+|----------|--------|
+| Book with no token | ✅ 401 |
+| Demo user books B1 + B2 at showtime 1 | ✅ 201, `totalCents: 2400` (2 × 1200), seats priced 1200 |
+| Bob books B2 + A1 | ✅ 409 `Seat(s) already taken: A1, B2` |
+| Bob adds `"totalCents": 1` | ✅ 400 `Unrecognized key` |
+| A Hall 2 seat for a Hall 1 showtime | ✅ 400 `Seat id(s) not in this showtime's hall: 41` |
+| `seatIds: [5, 5]` / unknown showtime | ✅ 400 / 400 |
+| A showtime that already started | ✅ 409 `SHOWTIME_STARTED` |
+| Rows left by the failed attempts | ✅ none |
+| `/reservations/me` | ✅ both of the demo user's reservations, with seats and prices |
+| Bob reads / cancels the demo user's reservation | ✅ 404 / 404 |
+| Admin reads it | ✅ 200 |
+| Owner cancels, then cancels again | ✅ 200 `cancelled` / 409 `ALREADY_CANCELLED` |
+| Bob books the freed B2 | ✅ 201 |
+| **Cancel a reservation for a past showtime** | ✅ **409 `SHOWTIME_STARTED`** |
+| Admin changes the price after booking | ✅ existing reservation keeps 1200 |
+| **`npm run race`** (20 requests, 1 seat) | ✅ **1 × 201, 19 × 409** (and 1 / 49 with 50 requests) |
+| Same, with the unique index dropped | ❌ 20 × 201: overbooking, as the plan predicts |
+
+`requests.http` has a new Reservations section. Seat ids: Hall 1 is 1–40 (A1 = 1, B1 = 9, ... E8 = 40), Hall 2 is 41–64.
+
+### Self-check answers
+
+<details>
+<summary>What does "atomic" mean? What happens to step 3 if step 4 throws?</summary>
+
+**Atomic** means all or nothing: the transaction's changes become visible together at `COMMIT`, or not at all. If anything throws before the
+commit (a failed seat insert, a bug while computing the total, the connection dropping), Drizzle sends `ROLLBACK`, and the reservation row
+inserted in step 3 disappears as if it had never existed. No other request ever saw it, because uncommitted rows are invisible to other
+transactions. This was verified: failed bookings left no rows behind.
+</details>
+
+<details>
+<summary>Compare the optimistic approach (unique constraint) and the pessimistic one (<code>SELECT ... FOR UPDATE</code>). When would you choose each?</summary>
+
+- **Optimistic (what we built):** just try the insert, and let a constraint reject the loser. No locks are taken in advance; conflicts are
+  detected at write time. Best when conflicts are **rare** (most people pick different seats) and the rule fits a constraint ("unique per
+  seat and showtime"). Cheap, simple, and impossible to get wrong in application code.
+- **Pessimistic:** lock first (`SELECT ... FOR UPDATE` on the rows you'll change), then check and write while others wait. Best when
+  conflicts are **frequent** (everyone fighting over the same row, like a counter or a stock level), when the rule **can't be expressed as a
+  constraint** (Phase 4's "no reservations" check), or when retrying would be expensive. The cost: waiting, and the risk of deadlocks if
+  locks are taken in different orders.
+
+This project uses both: a unique index for seats, and `FOR UPDATE` / `FOR SHARE` where a check must stay true until the write.
+</details>
+
+<details>
+<summary>Why should user A get a 404 (not a 403) when trying to cancel user B's reservation?</summary>
+
+A 403 says "this exists, but you can't touch it". Ids are sequential, so an attacker could walk `/reservations/1`, `/2`, `/3`... and learn
+how many reservations exist and which ids are real (*enumeration*). A 404 treats "not yours" exactly like "doesn't exist", so it reveals
+nothing. The query itself filters by `user_id`, so another user's reservation is simply never found.
+</details>
+
+### Idempotency (from "Learn", not built yet)
+
+If a booking request times out on the client side, did it succeed? Retrying could book **two** reservations (for different seats) or show a
+confusing 409 for your *own* seats. The standard fix is an `Idempotency-Key` header: the client sends a random key per booking attempt; the
+server stores `(user_id, key) → response` and, if it sees the same key again, returns the stored response instead of booking again.
+It's practice exercise 4 below.
+
+### Try it yourself (practice)
+
+1. Run `npm run race -- --requests 100`. Then book a **different** seat in each request (change the script) and check that all succeed.
+2. Add `GET /reservations` (admin only) with filters like `?showtimeId=` and `?status=`. It's a preview of Phase 7.
+3. Add a rule: at most 10 seats per user per showtime, **across** reservations. Can a constraint express it? If not, which lock would you use?
+4. Implement `Idempotency-Key` for `POST /reservations` with a new table and a unique index on `(user_id, key)`.
+5. Change `createReservation` to check "are the seats free?" with a `SELECT` first, drop the unique index, and run the race. Does the check help?
+   (Recreate the index afterwards, as described above.)
+
+### Next: Phase 7, admin reporting
+
+Admin-only reports: `GET /admin/reservations` (filtered, paginated), per-showtime seats sold, capacity, occupancy and revenue, and
+revenue and tickets per movie, using `COUNT`, `SUM`, `GROUP BY` and CTEs, checked against numbers calculated by hand from the seed.
