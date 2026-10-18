@@ -35,24 +35,6 @@ export function createApp({
   // rate limiter would make all users share a single budget.
   app.set("trust proxy", trustProxyHops);
 
-  // TEMPORARY: shows each caller how their own request reached the app, to measure
-  // Render's proxy chain. Reverted once TRUST_PROXY_HOPS is confirmed.
-  app.use((req, res, next) => {
-    res.setHeader(
-      "X-Debug-Proxy",
-      JSON.stringify({
-        ip: req.ip,
-        ips: req.ips,
-        socket: req.socket.remoteAddress,
-        xff: req.headers["x-forwarded-for"],
-        realIp: req.headers["x-real-ip"],
-        cfIp: req.headers["cf-connecting-ip"],
-        trueClientIp: req.headers["true-client-ip"],
-      }),
-    );
-    next();
-  });
-
   // Order matters. First: give every request an id and log it, so even
   // requests rejected by later middleware show up in the logs.
   app.use(requestLogger);
