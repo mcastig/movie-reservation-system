@@ -22,7 +22,10 @@
     "db:migrate": "drizzle-kit migrate",
     "db:seed": "tsx --env-file-if-exists=.env src/db/seed.ts",
     "db:studio": "drizzle-kit studio",
-    "race": "tsx scripts/race.ts"
+    "race": "tsx scripts/race.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run --project unit"
   },
   "dependencies": {
     "argon2": "^0.45.1",
