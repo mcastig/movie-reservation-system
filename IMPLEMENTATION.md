@@ -15,7 +15,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 6: Reservations
 - [x] Phase 7: Admin reporting
 - [x] Phase 8: Testing
-- [ ] Phase 9: Hardening
+- [x] Phase 9: Hardening
 - [ ] Phase 10: Docker, CI and deploy
 - [ ] Phase 11: Extensions
 
@@ -29,6 +29,7 @@ npm run db:migrate        # creates the tables
 npm run db:seed           # wipes and fills the tables with sample data
 npm run dev               # API on http://localhost:3000, restarts on file changes
 curl localhost:3000/health
+open http://localhost:3000/docs   # interactive API docs (Swagger UI)
 npm test                  # 84 tests; creates and migrates a separate movies_test database
 ```
 
@@ -1801,7 +1802,210 @@ the last test had left duplicate rows behind, so they had to be cleared first.
    Is 100% worth it?
 5. Make a test fail on purpose, then read Vitest's diff output. Then make a *test* wrong (not the code) and see how that looks.
 
-### Next: Phase 9, hardening
+---
 
-`helmet` security headers, `cors` with an allow-list, rate limiting on `/auth/*`, request logging with pino (with a request id),
-an OpenAPI spec with Swagger UI at `/docs`, and a review of every endpoint: is input validated, is ownership checked, does it leak data?
+## Phase 9: Hardening ✅
+
+**Goal:** the API behaves well when someone is trying to misuse it, and when something goes wrong you can find out what happened.
+Plus documentation so others can use it.
+
+### Files created or changed
+
+```
+src/
+├── app.ts                         # createApp(options); middleware order; /docs and /openapi.json
+├── config/env.ts                  # + LOG_LEVEL, CORS_ORIGINS, API_RATE_LIMIT_MAX, AUTH_RATE_LIMIT_*
+├── lib/logger.ts                  # pino: JSON in production, one pretty line in development, redaction
+├── middleware/requestLogger.ts    # pino-http: request ids, one log line per request
+├── middleware/security.ts         # helmet, cors allow-list, rateLimiter()
+├── middleware/errorHandler.ts     # logs with req.log; 500s include the request id
+├── server.ts                      # logs through pino
+└── docs/openapi.ts                # OpenAPI 3.1 document built from the Zod schemas
+tests/integration/hardening.test.ts  # 12 tests for all of the above
+```
+
+### Step 1: dependencies
+
+```bash
+npm install helmet cors express-rate-limit pino pino-http swagger-ui-express
+npm install -D @types/cors @types/swagger-ui-express pino-pretty
+```
+
+`npm audit --omit=dev` (production dependencies only) reports **0 vulnerabilities**. The 4 moderate ones from Phase 3 are still
+in drizzle-kit, a dev tool.
+
+### Step 2: middleware order in `createApp()`
+
+```ts
+app.use(requestLogger);          // 1. id + log line for EVERY request, even ones rejected below
+app.use(securityHeaders);        // 2. helmet
+app.use(corsFor(corsOrigins));   // 3. CORS (answers preflight OPTIONS requests)
+app.use(rateLimiter(apiRateLimit));   // 4. 300 requests/minute per IP, whole API
+app.use(express.json({ limit: "100kb" }));  // 5. parse bodies, with a size cap
+...
+app.use("/auth", rateLimiter(authRateLimit), authRouter);   // 20 per 15 minutes per IP
+```
+
+Logging comes first so a request that's rate-limited or too large still leaves a trace. Rate limiting comes before body parsing,
+so a flood of huge bodies is rejected without parsing them.
+
+`app.ts` now exports **`createApp(options)`** (and still `export default app` for everything else). Tests use it to build an app with a
+tiny rate limit or a CORS allow-list, without touching environment variables.
+
+### Step 3: security headers (`helmet`)
+
+| Header | What it does |
+|--------|--------------|
+| (no `X-Powered-By`) | Doesn't advertise "Express", so attackers learn less |
+| `X-Content-Type-Options: nosniff` | Browsers must trust our `Content-Type`; a JSON response can't be "guessed" into HTML or JS |
+| `Strict-Transport-Security` | After one HTTPS visit, browsers refuse plain HTTP for a year |
+| `Content-Security-Policy` | Which scripts, styles and images a page may load. Matters for `/docs`, the only HTML we serve |
+| `X-Frame-Options: SAMEORIGIN` | Other sites can't put our pages in an iframe (clickjacking) |
+
+Swagger UI was checked against the CSP: its scripts are separate files (`'self'`), and helmet's default allows its inline `<style>`.
+The page and both script files return 200 (tested).
+
+### Step 4: CORS with an allow-list
+
+```
+CORS_ORIGINS=https://app.example.com,http://localhost:5173
+```
+
+**CORS is not access control.** It only tells *browsers* whether JavaScript on another website may read our responses. `curl`, mobile apps
+and servers ignore it. Authentication is what protects the data; CORS protects users' browsers from other sites using their session.
+Here there's no cookie session (tokens go in the `Authorization` header), so the risk is low, but an allow-list is still the right default.
+
+- **Default: empty**, so no cross-origin browser access until you list a frontend's origin.
+- Allowed origins may send `Content-Type` and `Authorization` and read `X-Request-Id` and `Location`.
+- Tested: a listed origin gets `Access-Control-Allow-Origin`; another origin, or any origin with the default config, gets nothing.
+
+### Step 5: rate limiting
+
+| Limiter | Default | Why |
+|---------|---------|-----|
+| Whole API | 300 requests / minute / IP | One client can't flood the server (seat maps, reports, the docs) |
+| `/auth/*` | 20 requests / 15 minutes / IP | Slows password guessing to a crawl. Also limits signup spam and refresh abuse. |
+
+- A blocked request gets **429** in the usual format, `{ error: { code: "TOO_MANY_REQUESTS", ... } }`, plus standard `RateLimit` and
+  `RateLimit-Policy` headers so a well-behaved client knows when to retry.
+- **Once blocked, even the right password fails** until the window passes. That's the point: otherwise an attacker just keeps guessing.
+- The counts live **in memory**. That's fine for one server process. With several instances, each would count separately; you'd use a
+  shared store like Redis.
+- The test suite logs in hundreds of times from `127.0.0.1`, so `tests/test-env.ts` raises both limits. The limiters themselves are tested
+  with `createApp({ authRateLimit: { limit: 3, ... } })`.
+
+### Step 6: logging with pino and request ids
+
+**Development** (`npm run dev`), one readable line per request:
+
+```
+[01:08:44] INFO: POST /auth/login 200 (74 ms)
+[01:08:44] INFO: GET /me 200 (3 ms)
+[01:08:44] WARN: GET /movies/999 404 (2 ms)
+```
+
+**Production** (`NODE_ENV=production`), one JSON object per line, which log tools can search by any field:
+
+```json
+{"level":40,"time":1792285739279,"req":{"id":"support-ticket-42","method":"GET","url":"/movies/999"},"res":{"statusCode":404},"responseTime":19,"msg":"GET /movies/999 404 (19 ms)"}
+```
+
+- **Request ids.** Every request gets a UUID, returned in the `X-Request-Id` header. If a load balancer already sent one, it's kept,
+  but only if it matches `^[\w-]{1,64}$`, so nobody can inject fake log lines through the header.
+- **500 responses include the id**: `{ error: { code: "INTERNAL_ERROR", message: "Something went wrong", requestId: "..." } }`.
+  A user can quote it, and you can find the exact log line with the full error. The client still gets no stack trace or message.
+- **Levels:** 5xx → `error`, 4xx → `warn`, the rest → `info`. `/health` isn't logged, because it would be noise every few seconds.
+- **Less data, less risk.** Each line has only the id, method, URL, status and time, not every header. `Authorization`, cookies and any
+  `password`/`refreshToken` fields are redacted anyway, as defense in depth. Verified: an access token sent to `/me` appeared nowhere in the log.
+- `LOG_LEVEL=silent` in tests keeps the output clean.
+
+Two bugs were found by reading the real logs, not by the tests:
+1. The first version printed every request **and response** header on every line: very noisy, and more data to protect.
+2. Messages said `POST /login` and `GET /` for `/auth/login` and `/me`. Inside a router mounted at `/auth`, Express rewrites `req.url`
+   to the part after the mount point. `req.originalUrl` keeps the full path.
+
+### Step 7: API docs at `/docs`
+
+- **`GET /openapi.json`**: an OpenAPI 3.1 document. **`GET /docs`**: Swagger UI, where you can read every endpoint, click **Authorize**, paste an
+  access token and try requests.
+- **Built from the same Zod schemas that validate requests**, using Zod 4's `z.toJSONSchema()` (`io: "input"`, so it describes what a client
+  *sends*). `createReservationBody` shows up as `required: ["showtimeId", "seatIds"]` with `additionalProperties: false`, which is exactly what
+  `strictObject` enforces. Change a schema and the docs follow. Paths, summaries and status codes are written by hand in `src/docs/openapi.ts`.
+- Protected operations get `401` (and `403` for admin ones) and a lock icon automatically.
+- That's a third option next to the two in `PLAN.md` (`zod-to-openapi`, hand-written YAML): no extra library, and no second copy of the schemas.
+- Response bodies are only described in words for now. Adding schemas for them is a practice exercise.
+
+### Step 8: the endpoint review (security-review checklist)
+
+Every route was listed from the source and checked (`grep` over the `*.routes.ts` files):
+
+| Route group | Input validated? | Who may call it | Ownership / leaks |
+|-------------|------------------|-----------------|-------------------|
+| `/auth/*` | ✅ Zod, strict | anyone (rate-limited) | Same error and timing for wrong email/password; tokens never logged |
+| `/me`, `/users/:id/role` | ✅ (`/me` has no input) | user / admin | Only `publicUserColumns` leave the API; admins can't change their own role |
+| `GET /genres`, `/movies...`, `/showtimes/:id(/seats)` | ✅ (`/genres` has no input) | anyone | Public catalog data only |
+| Catalog and showtime writes | ✅ | admin | Restrict FKs protect history |
+| `/reservations/*` | ✅ | user | Filtered by `user_id` in the query; others' reservations are 404 |
+| `/admin/*` | ✅ | admin (`router.use`) | Shows users' names and emails, which is intended for admins |
+| `/health`, `/openapi.json`, `/docs` | no input | anyone | API shape only, no data |
+
+| Checklist item | Status here |
+|----------------|-------------|
+| Secrets | ✅ Only in env vars. `.env` is git-ignored and was **never** in the history (checked with `git log --all -- .env`). No secret-looking literals in `src/`. |
+| Input validation | ✅ Every route that takes input runs `validate()`; bodies are strict (allow-list, not deny-list). |
+| SQL injection | ✅ Drizzle or `sql` templates with parameters everywhere. The only interpolated SQL is `CREATE DATABASE "${name}"` in the test setup, and the name is checked first. |
+| Authentication | ✅ Short-lived JWTs (algorithm pinned), hashed refresh tokens with rotation and reuse detection. |
+| Authorization | ✅ `requireRole("admin")` on every catalog or admin write; ownership in the reservations queries. |
+| XSS | ✅ JSON-only API; `nosniff` + CSP. **A frontend must still escape** movie titles and descriptions when rendering them. |
+| CSRF | ✅ Not applicable: no cookies. The browser never attaches credentials by itself, so another site can't make requests "as" the user. |
+| Rate limiting | ✅ Added the API-wide limit during this review (only `/auth` had one before). |
+| Sensitive data in errors / logs | ✅ Generic 500s with a request id; redaction; minimal log fields. 4xx messages from body-parser are fixed library strings. |
+| Security headers | ✅ helmet. |
+| CORS | ✅ Allow-list, empty by default. |
+| Dependencies | ✅ 0 vulnerabilities in production dependencies; `package-lock.json` committed. |
+| File uploads | Not built (the plan marks poster uploads optional). |
+| HTTPS | ⏭ Phase 10: TLS is handled by the hosting platform. HSTS is already sent. |
+| Supabase RLS, wallet signatures | Not applicable to this stack. |
+
+**Known gaps, left on purpose (with the reason):**
+
+| Gap | Risk | Plan |
+|-----|------|------|
+| `trust proxy` isn't configured | Behind a load balancer, every request would come from the proxy's IP, so one shared rate-limit bucket. Trusting `X-Forwarded-For` blindly would let clients fake their IP. | Phase 10: set it to the exact number of proxies of the platform. |
+| Expired and revoked refresh tokens are never deleted | The table grows forever (it's not a security hole: they're unusable) | A periodic `DELETE ... WHERE expires_at < now() - interval '30 days'` (Phase 10/11) |
+| Signup reveals that an email is taken (409) | Account enumeration, slowed by the rate limit | Email verification flow (Phase 11) |
+| Logout leaves the access token valid for ≤15 min | A stolen token keeps working briefly | Short TTL; a Redis deny-list if needed (Phase 11) |
+| Rate limits are per process, in memory | With several instances the limit multiplies | Redis store when scaling out |
+| Where clients store tokens | XSS in a frontend could steal a token from `localStorage` | Frontend concern: keep tokens in memory, or move to `httpOnly` cookies (then CSRF protection is needed) |
+
+### Verification
+
+`npm run typecheck` passes and `npm test` runs **96 tests** (12 new in `hardening.test.ts`):
+
+| Check | Result |
+|-------|--------|
+| No `X-Powered-By`; `nosniff`, HSTS and CSP present | ✅ |
+| `X-Request-Id`: generated (UUID), unique per request, safe incoming id kept, unsafe one replaced | ✅ |
+| CORS: listed origin allowed; other origin and default config get no `Access-Control-Allow-Origin` | ✅ |
+| `/auth` limit 3: 3 × 401, then 429 `TOO_MANY_REQUESTS` with `RateLimit-Policy`, even with the right password; `/movies` still 200 | ✅ |
+| API limit 5: 5 × 200, then 429 on another route | ✅ |
+| 200 kB body → JSON 413 | ✅ |
+| `/openapi.json`: 3.1.0, 21 paths, booking requires auth and has the strict body schema | ✅ |
+| `/docs/` page and its scripts load under the CSP | ✅ |
+| A crashing route → 500 with `requestId` equal to the header, and the internal message absent | ✅ |
+
+Checked by hand: the development and production log formats above, and that the access token doesn't appear in the log.
+
+### Try it yourself (practice)
+
+1. Open `http://localhost:3000/docs`, log in with `POST /auth/login`, click **Authorize**, and book seats from the browser.
+2. Add response schemas to the OpenAPI document (e.g. a Zod schema for a reservation, converted with `z.toJSONSchema`).
+3. Send 21 logins in a row with `curl` and read the `RateLimit` header on each response. When does it reset?
+4. Set `CORS_ORIGINS=http://localhost:5173`, then in a browser console on another page run `fetch("http://localhost:3000/movies")`.
+   Read the error. Does the request reach the server? (Check the log.)
+5. Write the refresh-token cleanup as a script (`npm run db:cleanup`) and decide how long revoked tokens should be kept for reuse detection.
+
+### Next: Phase 10, Docker, CI and deploy
+
+A production Docker image for the API, GitHub Actions running typecheck and tests on every push, and deploying with the database on Neon,
+including `trust proxy` and HTTPS.
