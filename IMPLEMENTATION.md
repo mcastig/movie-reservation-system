@@ -13,7 +13,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 4: Showtimes and scheduling
 - [x] Phase 5: Browsing and seat availability
 - [x] Phase 6: Reservations
-- [ ] Phase 7: Admin reporting
+- [x] Phase 7: Admin reporting
 - [ ] Phase 8: Testing
 - [ ] Phase 9: Hardening
 - [ ] Phase 10: Docker, CI and deploy
@@ -1458,7 +1458,190 @@ It's practice exercise 4 below.
 5. Change `createReservation` to check "are the seats free?" with a `SELECT` first, drop the unique index, and run the race. Does the check help?
    (Recreate the index afterwards, as described above.)
 
-### Next: Phase 7, admin reporting
+---
 
-Admin-only reports: `GET /admin/reservations` (filtered, paginated), per-showtime seats sold, capacity, occupancy and revenue, and
-revenue and tickets per movie, using `COUNT`, `SUM`, `GROUP BY` and CTEs, checked against numbers calculated by hand from the seed.
+## Phase 7: Admin reporting ✅
+
+**Goal:** admins can see every reservation and answer "how full were the shows, and how much did we make?"
+The numbers must match a hand calculation.
+
+### Files created or changed
+
+```
+src/
+├── lib/schemas.ts                          # + timeRangeFields, fromBeforeTo (shared ?from=&to=)
+├── modules/reservations/
+│   ├── reservations.schemas.ts             # + adminReservationsQuery
+│   └── reservations.service.ts             # + listAllReservations
+└── modules/admin/
+    ├── admin.schemas.ts                    # reportQuery
+    ├── reports.service.ts                  # the two reports, in SQL with CTEs
+    └── admin.routes.ts                     # everything here is admin only
+```
+
+### Endpoints (admin only: 401 without a token, 403 for regular users)
+
+| Method | Path | Returns |
+|--------|------|---------|
+| `GET` | `/admin/reservations?showtimeId=&status=&from=&to=&page=&limit=` | Every reservation (with its user), filtered and paginated |
+| `GET` | `/admin/reports/showtimes?from=&to=` | Per showtime: capacity, tickets sold, occupancy %, revenue, cancellations + totals |
+| `GET` | `/admin/reports/movies?from=&to=` | Per movie: showtimes, capacity, tickets sold, occupancy %, revenue + totals |
+
+```json
+GET /admin/reports/showtimes?from=2026-10-19T00:00:00Z&to=2026-10-20T00:00:00Z
+{ "range": { "from": "2026-10-19T00:00:00.000Z", "to": "2026-10-20T00:00:00.000Z" },
+  "totals": { "showtimes": 4, "capacity": 128, "ticketsSold": 10, "occupancyPct": 7.8,
+              "revenueCents": 11000, "cancelledReservations": 1 },
+  "showtimes": [
+    { "id": 1, "startsAt": "2026-10-19T14:00:00.000Z", "movie": { "id": 1, "title": "Inception" },
+      "hall": { "id": 1, "name": "Hall 1" }, "capacity": 40, "ticketsSold": 3, "occupancyPct": 7.5,
+      "revenueCents": 4400, "cancelledReservations": 0 }, ... ] }
+```
+
+### Step 1: the rules the numbers follow
+
+| Question | Answer in this project |
+|----------|------------------------|
+| **Do cancelled reservations count toward revenue?** | **No.** A cancellation is treated as a full refund. Only *active* `reservation_seats` are tickets sold. |
+| Are cancellations hidden? | No. They're reported as `cancelledReservations` per showtime. |
+| Which price counts? | The one **copied into `reservation_seats` at booking**. Raising a showtime's price later doesn't change past revenue. |
+| What does `from`/`to` filter on? | **When the show starts** (`showtimes.starts_at`), not when the booking was made. "October revenue" means shows in October. |
+| Range bounds? | `from` inclusive, `to` exclusive, so consecutive ranges never count a showtime twice. Both need a timezone, and `from` must be before `to`. |
+| Capacity? | The number of seats in the hall, counted from `seats`. |
+
+Another valid choice is filtering by **booking date** (`reservations.created_at`), which answers "how much did we *sell* this week?".
+It's a different question, and the important thing is to pick one and document it.
+
+### Step 2: the reports in SQL with CTEs
+
+`PLAN.md` suggested dropping to raw SQL for reports, so `reports.service.ts` uses `db.execute(sql\`...\`)`. Each **CTE**
+(`WITH name AS (...)`) is one named step:
+
+```sql
+with
+  capacity  as (select hall_id, count(*) as seats from seats group by hall_id),
+  sold      as (select showtime_id, count(*) as tickets, sum(price_cents) as revenue
+                from reservation_seats where active group by showtime_id),
+  cancelled as (select showtime_id, count(*) as reservations
+                from reservations where status = 'cancelled' group by showtime_id)
+select s.id, ..., c.seats as capacity,
+       coalesce(sold.tickets, 0)   as tickets_sold,
+       coalesce(sold.revenue, 0)   as revenue_cents,
+       coalesce(cancelled.reservations, 0) as cancelled_reservations
+from showtimes s
+join capacity c on c.hall_id = s.hall_id
+left join sold      on sold.showtime_id = s.id
+left join cancelled on cancelled.showtime_id = s.id
+where <starts_at range>
+```
+
+- **`GROUP BY` before joining.** Each CTE collapses its table to one row per hall or showtime *first*. If you joined `reservation_seats` and
+  `reservations` to `showtimes` and then grouped, each seat row would be repeated once per matching reservation row, and `SUM` would
+  count revenue several times (*fan-out*). Aggregating in separate steps avoids that.
+- **`LEFT JOIN` + `COALESCE`.** A showtime with no sales has no `sold` row. `LEFT JOIN` keeps the showtime anyway (with `NULL`), and
+  `COALESCE(x, 0)` turns that `NULL` into 0.
+- **The movies report starts `FROM movies`** and `LEFT JOIN`s the per-showtime numbers, so a movie with no showtimes in the range still
+  appears with zeros. Starting from `showtimes` would make it vanish. Both reports use the same `sold` step, so they always agree.
+- **Parameters, not string pasting.** `${from}` in the `sql` template becomes `$1`, sent separately from the query text, so it's safe
+  from SQL injection even though the SQL is hand-written.
+- **Views (from "Learn")** would be the next step. `CREATE VIEW showtime_sales AS ...` would store the `sold` logic in the database for reuse
+  by other tools (a BI dashboard, `psql`). It's not needed while only this code runs these queries.
+
+### Step 3: types that come back from raw SQL
+
+Two surprises, both found while testing:
+
+1. **`COUNT` and `SUM` come back as strings** (`"2400"`, not `2400`). Postgres returns them as `bigint`, and node-postgres gives a `bigint` as a
+   string because a JS `number` can't hold every 64-bit integer exactly. The service converts them with `Number()`, which is exact up to
+   `Number.MAX_SAFE_INTEGER` (about 90 trillion dollars in cents).
+2. **Timestamps came back as `"2026-10-19 14:00:00+00"`** instead of the ISO format of every other endpoint. Drizzle tells node-postgres to
+   return timestamps as text and converts them itself, but only for its typed queries. With raw `db.execute()` you get the text, so the
+   service wraps it in `new Date(...)`.
+
+### Step 4: `/admin/reservations`
+
+It reuses Phase 6's `findReservations` (with the same 2 queries plus one for the users), adding filters:
+
+- `showtimeId`, `status` and `from`/`to` (on the showtime's start).
+- `db.$count(reservations, where)` can only see the `reservations` table, so the time filter is a subquery,
+  `showtime_id IN (SELECT id FROM showtimes WHERE starts_at ...)`, which works for both the page and the count.
+- Each reservation includes `user: { id, name, email }` instead of just `userId`.
+
+`adminRouter.use(authenticate, requireRole("admin"))` protects every route under `/admin` in one line.
+
+### Verification (Phase 7 "done when": numbers match a hand calculation)
+
+**Seed only.** 3 days × (2 Hall 1 shows × 40 seats + 2 Hall 2 shows × 24 seats) = 3 × 128 = **384 seats**.
+The only booking is A1 + A2 at showtime 1, at 1200 each.
+
+| Report | Expected | Got |
+|--------|----------|-----|
+| Showtimes totals | 12 showtimes, 384 capacity, 2 sold, 0.5 %, 2400 | ✅ same |
+| Inception | 6 showtimes, 192 seats, 2 sold, 1.0 %, 2400 | ✅ |
+| Spirited Away | 3 showtimes, 72 seats, 0 sold | ✅ |
+| Grand Budapest | 3 showtimes, 120 seats, 0 sold | ✅ |
+
+**A scenario through the API.** Tomorrow: #1 Inception, Hall 1, 1200; #2 Budapest, Hall 1, 1000; #3 Spirited Away, Hall 2, 900; #4 Inception, Hall 2, 1400.
+
+1. Seed: demo user has 2 seats at #1 → 2400
+2. Bob books 3 seats at #2 → 3 × 1000 = 3000
+3. Demo user books 4 seats at #3 → 4 × 900 = 3600
+4. Bob books 2 seats at #4 (2800) and **cancels** → doesn't count
+5. Admin raises #1 to 2000; demo user books 1 more seat at #1 → 2000
+
+| Showtime | Capacity | Sold | Occupancy | Revenue | Cancelled | Got |
+|----------|----------|------|-----------|---------|-----------|-----|
+| #1 | 40 | 3 | 7.5 % | 2400 + 2000 = **4400** | 0 | ✅ |
+| #2 | 40 | 3 | 7.5 % | **3000** | 0 | ✅ |
+| #3 | 24 | 4 | 16.7 % | **3600** | 0 | ✅ |
+| #4 | 24 | 0 | 0 % | **0** | 1 | ✅ |
+| **Tomorrow** | 128 | 10 | 7.8 % | **11000** | 1 | ✅ |
+| **All time** | 384 | 10 | 2.6 % | **11000** | 1 | ✅ |
+
+By movie: Inception 3 tickets / 4400 / 1.6 %, Spirited Away 4 / 3600 / 5.6 %, Budapest 3 / 3000 / 2.5 % ✅ (sorted by revenue).
+For 2030, a range with no showtimes, every movie is still listed, with 0 showtimes and 0 revenue ✅.
+
+A cross-check in SQL shows why the cancellation rule matters: `sum(price_cents) filter (where active)` = **11000**, but summing every row
+would give **13800**, overstating revenue by Bob's refunded 2800.
+
+(While testing, the first hand calculation gave 13000. The report was right; the hand math was wrong. That's the point of checking both ways.)
+
+`/admin/reservations`:
+
+| Request | Result |
+|---------|--------|
+| No filters | ✅ 5 reservations, newest showtime first, each with `user` |
+| `status=cancelled` / `showtimeId=1` | ✅ only Bob's #4 / #5 and #1 |
+| Tomorrow's range / from the day after | ✅ 5 / 0 |
+| `page=2&limit=2` | ✅ items 3–4, `totalPages: 3` |
+| Regular user token | ✅ 403 |
+| `from` after `to` | ✅ 400 "`from` must be before `to`" |
+| `status=refunded` + `from` with no timezone | ✅ 400, both reported |
+
+`requests.http` has a new "Admin reports" section.
+
+### Self-check answer
+
+<details>
+<summary>Do cancelled reservations count toward revenue? Make sure your queries follow your answer.</summary>
+
+Here: **no**. Cancelling is treated as a full refund, so the money isn't ours. Every revenue figure comes from `reservation_seats WHERE active`,
+and cancelling sets `active = false` (Phase 6), so a cancelled seat drops out of both "tickets sold" and "revenue" with no extra
+condition in the reports. Cancellations are still counted separately, because a show with many cancellations is useful to know about.
+If the business kept a cancellation fee, you'd store it (a `refunded_cents` or `fee_cents` column) and add it to revenue, rather than
+counting the full price.
+</details>
+
+### Try it yourself (practice)
+
+1. Add `GET /admin/reports/days?from=&to=&tz=`: revenue per local day. (Hint: `date_trunc('day', starts_at AT TIME ZONE $tz)`, then `GROUP BY` it.)
+2. Rewrite the `sold` CTE as a view (`CREATE VIEW showtime_sales ...` in a custom migration) and use it in both reports.
+3. Join `reservation_seats` and `reservations` to `showtimes` directly and `GROUP BY showtimes.id`, without CTEs. Do the numbers change?
+   Why? (Fan-out.)
+4. Add a "top 3 showtimes by occupancy" to the showtimes report with `ORDER BY ... LIMIT 3`.
+5. Add `?sort=` to `/admin/reports/movies` (`revenue`, `tickets`, `title`). How do you allow it without building SQL from user input?
+
+### Next: Phase 8, testing
+
+Turn the manual checks from Phases 2–7 into automated tests: unit tests for the rules, Supertest integration tests against a separate
+test database, and the concurrency experiment as a test. Done when `npm test` is green.
