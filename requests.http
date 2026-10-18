@@ -1,0 +1,63 @@
+# Sample requests for the VS Code "REST Client" extension (click "Send Request").
+# Bruno and Postman can import or copy these too.
+@base = http://localhost:3000
+
+### Health
+GET {{base}}/health
+
+### --- Genres ---
+
+### List genres
+GET {{base}}/genres
+
+### Create a genre
+POST {{base}}/genres
+Content-Type: application/json
+
+{ "name": "Thriller" }
+
+### --- Movies ---
+
+### List movies (paginated, optional ?genre=<id>)
+GET {{base}}/movies?page=1&limit=20
+
+### Movies in one genre
+GET {{base}}/movies?genre=3
+
+### Get one movie
+GET {{base}}/movies/1
+
+### Create a movie
+POST {{base}}/movies
+Content-Type: application/json
+
+{
+  "title": "Arrival",
+  "description": "A linguist is recruited to talk with alien visitors.",
+  "posterUrl": "https://example.com/posters/arrival.jpg",
+  "durationMinutes": 116,
+  "genreIds": [3, 4]
+}
+
+### Update some fields (genreIds replaces the whole list)
+PATCH {{base}}/movies/4
+Content-Type: application/json
+
+{ "title": "Arrival (2016)", "genreIds": [4] }
+
+### Delete a movie (409 if it has showtimes, like movie 1)
+DELETE {{base}}/movies/4
+
+### --- Errors to try ---
+
+### 400: several validation problems at once
+POST {{base}}/movies
+Content-Type: application/json
+
+{ "title": "", "durationMinutes": -5, "posterUrl": "javascript:alert(1)" }
+
+### 400: malformed JSON
+POST {{base}}/movies
+Content-Type: application/json
+
+{ "title":
