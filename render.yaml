@@ -21,8 +21,12 @@ services:
       # Render generates a random value once and keeps it.
       - key: JWT_SECRET
         generateValue: true
-      # Render's proxy sits in front of the app (see TRUST_PROXY_HOPS in src/config/env.ts).
+      # Render puts two proxies in front of the app (see TRUST_PROXY_HOPS in src/config/env.ts).
+      # Measured, not guessed: with 1, the rate limiter saw changing proxy IPs instead of
+      # the client's. Check after changing it: the pk= value in the RateLimit-Policy header
+      # (a hash of the client key) must stay the same across requests, and must not change
+      # when you send a fake X-Forwarded-For header.
       - key: TRUST_PROXY_HOPS
-        value: "1"
+        value: "2"
       - key: THEATER_TIMEZONE
         value: UTC
