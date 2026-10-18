@@ -168,3 +168,36 @@ async function takenSeatLabels(showtimeId: number, seatIds: number[]) {
     .orderBy(asc(seats.rowLabel), asc(seats.seatNumber));
   return rows.map((r) => r.label);
 }
+
+// --- Cancelling ---
+
+// Rules: only the owner, only while confirmed, only before the showtime starts.
+// The reservation row is kept (status = cancelled) for history and reports;
+// its seats get active = false, which frees them for others.
+export async function cancelReservation(user: AuthUser, id: number) {
+  await db.transaction(async (tx) => {
+    // FOR UPDATE OF reservations: two cancels of the same reservation run one
+    // after the other, so the second one sees "cancelled" and gets a 409.
+    const [reservation] = await tx
+      .select({ status: reservations.status, startsAt: showtimes.startsAt })
+      .from(reservations)
+      .innerJoin(showtimes, eq(showtimes.id, reservations.showtimeId))
+      .where(and(eq(reservations.id, id), eq(reservations.userId, user.id)))
+      .for("update", { of: reservations });
+
+    if (!reservation) throw new NotFoundError(`Reservation ${id} not found`);
+    if (reservation.status === "cancelled") {
+      throw new ConflictError("ALREADY_CANCELLED", "This reservation is already cancelled");
+    }
+    if (reservation.startsAt.getTime() <= Date.now()) {
+      throw new ConflictError("SHOWTIME_STARTED", "Only upcoming reservations can be cancelled");
+    }
+
+    await tx
+      .update(reservations)
+      .set({ status: "cancelled", cancelledAt: sql`now()` })
+      .where(eq(reservations.id, id));
+    await tx.update(reservationSeats).set({ active: false }).where(eq(reservationSeats.reservationId, id));
+  });
+  return getReservation(user, id);
+}

@@ -23,3 +23,8 @@ reservationsRouter.get("/me", validate({ query: paginationQuery }), async (req, 
 reservationsRouter.get("/:id", validate({ params: idParams }), async (req, res) => {
   res.json(await reservationsService.getReservation(req.user!, req.params.id));
 });
+
+// POST, not DELETE: cancelling changes the reservation's state; the record stays.
+reservationsRouter.post("/:id/cancel", validate({ params: idParams }), async (req, res) => {
+  res.json(await reservationsService.cancelReservation(req.user!, req.params.id));
+});
