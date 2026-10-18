@@ -36,6 +36,24 @@ export const users = pgTable(
   ],
 );
 
+// One row per refresh token handed out. Only a SHA-256 hash is stored, so a
+// leaked database dump can't be used to log in. revoked_at is set on logout and
+// when the token is exchanged for a new one (rotation).
+export const refreshTokens = pgTable(
+  "refresh_tokens",
+  {
+    id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    expiresAt: timestamptz("expires_at").notNull(),
+    createdAt: timestamptz("created_at").notNull().defaultNow(),
+    revokedAt: timestamptz("revoked_at"),
+  },
+  (t) => [index("refresh_tokens_user_id_idx").on(t.userId)],
+);
+
 export const genres = pgTable("genres", {
   id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
   name: text("name").notNull().unique(),

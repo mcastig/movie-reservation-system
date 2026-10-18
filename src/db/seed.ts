@@ -35,7 +35,7 @@ const tomorrow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDat
 await db.transaction(async (tx) => {
   // RESTART IDENTITY resets the id counters so ids start at 1 again.
   await tx.execute(sql`
-    truncate users, genres, movies, movie_genres, halls, seats,
+    truncate users, refresh_tokens, genres, movies, movie_genres, halls, seats,
              showtimes, reservations, reservation_seats
     restart identity cascade
   `);
