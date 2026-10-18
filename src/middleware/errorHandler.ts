@@ -3,6 +3,7 @@ import {
   AppError,
   isPgError,
   NotFoundError,
+  PG_EXCLUSION_VIOLATION,
   PG_FOREIGN_KEY_VIOLATION,
   PG_UNIQUE_VIOLATION,
 } from "../lib/errors.ts";
@@ -36,6 +37,9 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
   // Safety net for constraint violations a service didn't translate itself.
   if (isPgError(err, PG_UNIQUE_VIOLATION)) {
     return send(res, 409, "CONFLICT", "A record with these values already exists");
+  }
+  if (isPgError(err, PG_EXCLUSION_VIOLATION)) {
+    return send(res, 409, "CONFLICT", "This change overlaps with an existing record");
   }
   if (isPgError(err, PG_FOREIGN_KEY_VIOLATION)) {
     return send(res, 409, "CONFLICT", "This change conflicts with related records");
