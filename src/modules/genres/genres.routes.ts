@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { authenticate, requireRole } from "../../middleware/auth.ts";
 import { validate } from "../../middleware/validate.ts";
 import { createGenreBody } from "./genres.schemas.ts";
 import * as genresService from "./genres.service.ts";
@@ -9,6 +10,12 @@ genresRouter.get("/", async (_req, res) => {
   res.json(await genresService.listGenres());
 });
 
-genresRouter.post("/", validate({ body: createGenreBody }), async (req, res) => {
-  res.status(201).json(await genresService.createGenre(req.body));
-});
+genresRouter.post(
+  "/",
+  authenticate,
+  requireRole("admin"),
+  validate({ body: createGenreBody }),
+  async (req, res) => {
+    res.status(201).json(await genresService.createGenre(req.body));
+  },
+);
