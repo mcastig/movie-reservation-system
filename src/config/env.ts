@@ -17,6 +17,22 @@ const envSchema = z.object({
   // IANA name of the cinema's timezone. Decides what "showtimes on 2026-10-20" means.
   THEATER_TIMEZONE: timeZoneSchema.default("UTC"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
+  // Browser origins allowed to call the API, comma-separated (e.g. "https://app.example.com").
+  // Empty (the default) means no cross-origin browser access at all.
+  CORS_ORIGINS: z
+    .string()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+    ),
+  // At most API_RATE_LIMIT_MAX requests per IP per minute to the whole API...
+  API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(300),
+  // ...and at most AUTH_RATE_LIMIT_MAX requests to /auth/* per IP in each window.
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
+  AUTH_RATE_LIMIT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
 });
 
 const parsed = envSchema.safeParse(process.env);

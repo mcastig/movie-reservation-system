@@ -12,8 +12,12 @@ export const testEnv = {
   JWT_SECRET: "test-only-secret-that-is-at-least-32-characters",
   THEATER_TIMEZONE: "UTC",
   CLEANING_BUFFER_MINUTES: "15",
-  // Quiet output during tests.
+  // Quiet output; tests that check logging or rate limits configure their own.
   LOG_LEVEL: "silent",
+  // The suite logs in hundreds of times from one IP. The limiter itself is tested
+  // with a small limit in hardening.test.ts.
+  AUTH_RATE_LIMIT_MAX: "100000",
+  API_RATE_LIMIT_MAX: "100000",
 };
 
 export function assertTestDatabase(url: string) {
