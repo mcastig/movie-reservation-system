@@ -78,6 +78,26 @@ describe("rate limiting", () => {
     const blocked = await request(app).get("/genres").expect(429);
     expect(blocked.body.error.code).toBe("TOO_MANY_REQUESTS");
   });
+
+  // X-Forwarded-For is the header a proxy adds with the client's real IP.
+  const from = (app: ReturnType<typeof createApp>, ip: string) =>
+    request(app).get("/genres").set("X-Forwarded-For", ip);
+
+  it("ignores X-Forwarded-For by default, so clients can't fake a new IP", async () => {
+    const app = createApp({ apiRateLimit: { limit: 2, windowMinutes: 1 } });
+    await from(app, "1.1.1.1").expect(200);
+    await from(app, "2.2.2.2").expect(200);
+    await from(app, "3.3.3.3").expect(429);
+  });
+
+  it("behind a trusted proxy, limits each client by its real IP", async () => {
+    const app = createApp({ apiRateLimit: { limit: 2, windowMinutes: 1 }, trustProxyHops: 1 });
+    await from(app, "1.1.1.1").expect(200);
+    await from(app, "1.1.1.1").expect(200);
+    await from(app, "1.1.1.1").expect(429);
+    // A different client still has its own budget.
+    await from(app, "2.2.2.2").expect(200);
+  });
 });
 
 describe("request size", () => {

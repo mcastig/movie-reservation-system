@@ -33,6 +33,10 @@ const envSchema = z.object({
   // ...and at most AUTH_RATE_LIMIT_MAX requests to /auth/* per IP in each window.
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   AUTH_RATE_LIMIT_WINDOW_MINUTES: z.coerce.number().int().positive().default(15),
+  // How many proxies (load balancers) sit in front of the app. Hosting platforms add
+  // one; the client's real IP then arrives in the X-Forwarded-For header. 0 (the default)
+  // trusts nobody, so a client can't fake its IP to dodge the rate limits.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
 });
 
 const parsed = envSchema.safeParse(process.env);

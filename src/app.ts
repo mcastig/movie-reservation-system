@@ -17,6 +17,7 @@ export type AppOptions = {
   corsOrigins?: string[];
   apiRateLimit?: RateLimitOptions;
   authRateLimit?: RateLimitOptions;
+  trustProxyHops?: number;
 };
 
 // Builds the Express app without starting a server, so tests can import it and
@@ -26,8 +27,13 @@ export function createApp({
   corsOrigins = env.CORS_ORIGINS,
   apiRateLimit = { limit: env.API_RATE_LIMIT_MAX, windowMinutes: 1 },
   authRateLimit = { limit: env.AUTH_RATE_LIMIT_MAX, windowMinutes: env.AUTH_RATE_LIMIT_WINDOW_MINUTES },
+  trustProxyHops = env.TRUST_PROXY_HOPS,
 }: AppOptions = {}): Express {
   const app = express();
+  // Makes req.ip the client's address instead of the proxy's (see TRUST_PROXY_HOPS).
+  // Without it, behind a proxy every request seems to come from one IP, so the
+  // rate limiter would make all users share a single budget.
+  app.set("trust proxy", trustProxyHops);
 
   // Order matters. First: give every request an id and log it, so even
   // requests rejected by later middleware show up in the logs.
