@@ -118,6 +118,35 @@ GET {{base}}/movies/showtimes?date=2026-10-19&tz=Asia/Tokyo
 ### Seat map of a showtime (seats A1 and A2 are taken in the seed)
 GET {{base}}/showtimes/1/seats
 
+### --- Reservations (logged-in users) ---
+# Send "Log in as the demo user" first. Seat ids: Hall 1 is 1-40 (A1=1 ... E8=40), Hall 2 is 41-64.
+
+### Book seats B1 and B2 for showtime 1 (the server computes the total)
+POST {{base}}/reservations
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+Content-Type: application/json
+
+{ "showtimeId": 1, "seatIds": [9, 10] }
+
+### 409 SEATS_TAKEN: A1 is booked in the seed
+POST {{base}}/reservations
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+Content-Type: application/json
+
+{ "showtimeId": 1, "seatIds": [1] }
+
+### My reservations (newest showtime first, paginated)
+GET {{base}}/reservations/me
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+
+### One reservation (yours, or any if you're an admin)
+GET {{base}}/reservations/1
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+
+### Cancel (only yours, only upcoming); the seats become free again
+POST {{base}}/reservations/1/cancel
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+
 ### --- Showtimes ---
 # Times must include a timezone: "Z" (UTC) or an offset like "-06:00".
 # The seed schedules showtimes for the next 3 days; pick a date after them.
