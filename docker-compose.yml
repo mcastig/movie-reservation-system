@@ -17,5 +17,25 @@ services:
       timeout: 3s
       retries: 10
 
+  # The API, built from our Dockerfile and run like it would be in production.
+  # `docker compose up --build` starts both services; `npm run db:up` still starts
+  # only the database, for day-to-day work with `npm run dev`.
+  api:
+    build: .
+    container_name: movies-api
+    environment:
+      # Inside Compose's network, the database's hostname is its service name: "db".
+      DATABASE_URL: postgres://movies:movies@db:5432/movies
+      # Compose fills ${...} from your shell or from the .env file next to this one.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      LOG_LEVEL: info
+    ports:
+      # 8080 on your machine, so it doesn't clash with `npm run dev` on 3000.
+      - "8080:3000"
+    depends_on:
+      # Wait until Postgres passes its healthcheck, not just until the container starts.
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

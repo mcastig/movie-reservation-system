@@ -1,0 +1,14 @@
+# Files Docker never sends to the build. Keeps the build fast and keeps
+# secrets (.env) and local junk out of the image.
+node_modules
+.git
+.github
+.claude
+.agents
+.env
+.env.*
+coverage
+dist
+tests
+*.log
+.DS_Store
