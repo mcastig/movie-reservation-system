@@ -1,9 +1,63 @@
 # Sample requests for the VS Code "REST Client" extension (click "Send Request").
 # Bruno and Postman can import or copy these too.
 @base = http://localhost:3000
+# Send "Log in as admin" first: the write requests below reuse its token.
+@admin = Bearer {{adminLogin.response.body.accessToken}}
 
 ### Health
 GET {{base}}/health
+
+### --- Auth ---
+
+### Sign up (always creates a regular user)
+POST {{base}}/auth/signup
+Content-Type: application/json
+
+{ "email": "ana@example.com", "password": "correct-horse", "name": "Ana" }
+
+### Log in as admin
+# @name adminLogin
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@example.com", "password": "admin-password" }
+
+### Log in as the demo user
+# @name userLogin
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "user@example.com", "password": "user-password" }
+
+### Who am I?
+GET {{base}}/me
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+
+### Exchange the refresh token for a new pair (works once per token)
+POST {{base}}/auth/refresh
+Content-Type: application/json
+
+{ "refreshToken": "{{userLogin.response.body.refreshToken}}" }
+
+### Log out (revokes the refresh token)
+POST {{base}}/auth/logout
+Content-Type: application/json
+
+{ "refreshToken": "{{userLogin.response.body.refreshToken}}" }
+
+### Promote user 2 to admin (admin only)
+PATCH {{base}}/users/2/role
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "role": "admin" }
+
+### 403: a regular user trying to create a movie
+POST {{base}}/movies
+Authorization: Bearer {{userLogin.response.body.accessToken}}
+Content-Type: application/json
+
+{ "title": "Nope", "description": "Not allowed", "durationMinutes": 90 }
 
 ### --- Genres ---
 
@@ -12,6 +66,7 @@ GET {{base}}/genres
 
 ### Create a genre
 POST {{base}}/genres
+Authorization: {{admin}}
 Content-Type: application/json
 
 { "name": "Thriller" }
@@ -29,6 +84,7 @@ GET {{base}}/movies/1
 
 ### Create a movie
 POST {{base}}/movies
+Authorization: {{admin}}
 Content-Type: application/json
 
 {
@@ -41,23 +97,27 @@ Content-Type: application/json
 
 ### Update some fields (genreIds replaces the whole list)
 PATCH {{base}}/movies/4
+Authorization: {{admin}}
 Content-Type: application/json
 
 { "title": "Arrival (2016)", "genreIds": [4] }
 
 ### Delete a movie (409 if it has showtimes, like movie 1)
 DELETE {{base}}/movies/4
+Authorization: {{admin}}
 
 ### --- Errors to try ---
 
 ### 400: several validation problems at once
 POST {{base}}/movies
+Authorization: {{admin}}
 Content-Type: application/json
 
 { "title": "", "durationMinutes": -5, "posterUrl": "javascript:alert(1)" }
 
 ### 400: malformed JSON
 POST {{base}}/movies
+Authorization: {{admin}}
 Content-Type: application/json
 
 { "title":
