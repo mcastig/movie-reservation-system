@@ -106,6 +106,52 @@ Content-Type: application/json
 DELETE {{base}}/movies/4
 Authorization: {{admin}}
 
+### --- Showtimes ---
+# Times must include a timezone: "Z" (UTC) or an offset like "-06:00".
+# The seed schedules showtimes for the next 3 days; pick a date after them.
+
+### Get one showtime (public)
+GET {{base}}/showtimes/1
+
+### Create a showtime (ends_at = start + duration + cleaning buffer)
+POST {{base}}/showtimes
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "movieId": 3, "hallId": 2, "startsAt": "2030-01-15T20:00:00Z", "priceCents": 1100 }
+
+### 409 HALL_BUSY: same hall, overlapping time (send the one above first)
+POST {{base}}/showtimes
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "movieId": 1, "hallId": 2, "startsAt": "2030-01-15T21:00:00Z", "priceCents": 1100 }
+
+### Same time in another hall is fine
+POST {{base}}/showtimes
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "movieId": 1, "hallId": 1, "startsAt": "2030-01-15T21:00:00Z", "priceCents": 1100 }
+
+### Change only the price (always allowed before it starts)
+PATCH {{base}}/showtimes/1
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "priceCents": 1300 }
+
+### 409: showtime 1 has a reservation, so it can't move
+PATCH {{base}}/showtimes/1
+Authorization: {{admin}}
+Content-Type: application/json
+
+{ "startsAt": "2030-01-16T18:00:00Z" }
+
+### 409: can't delete a showtime that has reservations
+DELETE {{base}}/showtimes/1
+Authorization: {{admin}}
+
 ### --- Errors to try ---
 
 ### 400: several validation problems at once
