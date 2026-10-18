@@ -8,6 +8,9 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.url(),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
+  // Short-lived access tokens limit the damage if one leaks; refresh tokens renew them.
+  ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(15 * 60),
+  REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
 });
 
 const parsed = envSchema.safeParse(process.env);
