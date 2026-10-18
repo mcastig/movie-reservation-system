@@ -11,7 +11,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 2: Movies and genres CRUD
 - [x] Phase 3: Authentication and authorization
 - [x] Phase 4: Showtimes and scheduling
-- [ ] Phase 5: Browsing and seat availability
+- [x] Phase 5: Browsing and seat availability
 - [ ] Phase 6: Reservations
 - [ ] Phase 7: Admin reporting
 - [ ] Phase 8: Testing
@@ -1055,7 +1055,204 @@ fails no matter how they're timed. It also protects data written any other way: 
    `insert into reservations (user_id, showtime_id, total_cents) values (2, 2, 0);`. What happens? Now `commit;` the first one.
 5. A showtime is at 23:00 UTC. On which calendar day is it for a user in Mexico City (UTC-6)? And in Madrid (UTC+2)?
 
-### Next: Phase 5, browsing and seat availability
+---
 
-`GET /movies/showtimes?date=` (movies with their showtimes on a given day) and `GET /showtimes/:id/seats` (the seat map,
-with each seat's availability).
+## Phase 5: Browsing and seat availability ✅
+
+**Goal:** the two read endpoints a customer needs before booking: *what's on that day?* and *which seats are free?*
+Both are public.
+
+### Files changed
+
+```
+src/
+├── config/env.ts                       # + THEATER_TIMEZONE (default "UTC"), validated at startup
+├── lib/schemas.ts                      # + timeZoneSchema
+├── lib/errors.ts                       # + PG_INVALID_PARAMETER_VALUE ("22023")
+├── modules/movies/movies.routes.ts     # + GET /movies/showtimes (registered before /:id)
+├── modules/movies/movies.service.ts    # genresByMovie is now exported for reuse
+└── modules/showtimes/
+    ├── showtimes.schemas.ts            # + scheduleQuery
+    ├── showtimes.service.ts            # + getDaySchedule, getSeatMap
+    └── showtimes.routes.ts             # + GET /showtimes/:id/seats
+```
+
+### Endpoints
+
+| Method | Path | Success | Errors |
+|--------|------|---------|--------|
+| `GET` | `/movies/showtimes?date=YYYY-MM-DD[&tz=Area/City]` | 200, movies with nested showtimes | 400 bad date or timezone |
+| `GET` | `/showtimes/:id/seats` | 200, the seat map grouped by row | 400, 404 |
+
+```json
+GET /movies/showtimes?date=2026-10-19
+{ "date": "2026-10-19", "timezone": "UTC",
+  "movies": [
+    { "id": 1, "title": "Inception", "durationMinutes": 148, "posterUrl": "...", "description": "...",
+      "genres": [{ "id": 1, "name": "Action" }, { "id": 4, "name": "Sci-Fi" }],
+      "showtimes": [
+        { "id": 1, "startsAt": "2026-10-19T14:00:00.000Z", "endsAt": "2026-10-19T16:43:00.000Z",
+          "priceCents": 1200, "seatsAvailable": 38, "hall": { "id": 1, "name": "Hall 1" } } ] } ] }
+
+GET /showtimes/1/seats
+{ "showtime": { "id": 1, "startsAt": "...", "movie": { ... }, "hall": { "id": 1, "name": "Hall 1" }, ... },
+  "totalSeats": 40, "availableSeats": 38,
+  "rows": [ { "row": "A", "seats": [ { "id": 1, "number": 1, "available": false }, ... ] }, ... ] }
+```
+
+### Step 1: what "a day" means
+
+The API stores and returns UTC, but `?date=2026-10-19` is a **local** calendar day. Local to whom?
+
+- **Default: the theater's timezone** (`THEATER_TIMEZONE`). A cinema is in one place, so "Tuesday's showtimes" means
+  Tuesday where the cinema is, wherever the customer is browsing from.
+- **Override:** `&tz=Europe/Madrid`, for a client that wants another zone's days.
+- **Timezone names are validated** with `Intl.DateTimeFormat` (it throws a `RangeError` for unknown names), both in the query and in `env.ts`,
+  so a typo in `.env` stops the app at startup. If Postgres ever rejects a name that Intl accepted (error `22023`), it's still a 400.
+
+The day's boundaries are computed **in Postgres**:
+
+```sql
+starts_at >= ('2026-10-19'::date)::timestamp     AT TIME ZONE 'Asia/Tokyo'   -- 2026-10-18 15:00 UTC
+starts_at <  ('2026-10-19'::date + 1)::timestamp AT TIME ZONE 'Asia/Tokyo'   -- 2026-10-19 15:00 UTC
+```
+
+`timestamp AT TIME ZONE zone` means "this wall-clock time, read in that zone" and gives a UTC instant.
+Postgres knows the daylight-saving rules. **2026-10-25 in Madrid is 25 hours long** (clocks go back), from 22:00 UTC to
+23:00 UTC the next day. A fixed "+24 hours" in JavaScript would get that day wrong.
+
+Only **upcoming** showtimes are listed (`starts_at > now()`). This endpoint is for choosing what to book; admins get
+all showtimes in the Phase 7 reports.
+
+### Step 2: the schedule query
+
+One query returns one row per showtime, with its movie and hall joined in. JavaScript then nests the rows under their movie:
+
+```
+rows:   (Inception, 14:00) (Inception, 19:00) (Spirited Away, 15:00) ...
+result: Inception → [14:00, 19:00],  Spirited Away → [15:00], ...
+```
+
+Sorting by `title, id, starts_at` in SQL means the `Map` keeps that order. Genres are loaded with Phase 2's `genresByMovie` in one
+more query. Total: **2 queries**, however many movies and showtimes there are.
+
+**`seatsAvailable`** uses two *correlated subqueries*, which run once per showtime row:
+
+```sql
+(select count(*) from seats where seats.hall_id = showtimes.hall_id)
+- (select count(*) from reservation_seats where showtime_id = showtimes.id and active)
+```
+
+**Range, not function.** The filter is `starts_at >= X AND starts_at < Y`, not `date(starts_at) = '2026-10-19'`.
+Wrapping the column in a function hides it from the index (see Step 4).
+
+### Step 3: the seat map, and LEFT JOIN with conditions in `ON`
+
+```sql
+select seats.*, reservation_seats.seat_id is null as available
+from seats
+left join reservation_seats
+  on  reservation_seats.seat_id = seats.id
+  and reservation_seats.showtime_id = $1
+  and reservation_seats.active
+where seats.hall_id = $hall
+order by row_label, seat_number
+```
+
+- **LEFT JOIN** keeps every seat. A seat with no matching booking still appears, with `NULL`s in the `reservation_seats` columns:
+  that `NULL` *is* "available".
+- **The booking conditions must be in `ON`, not `WHERE`.** `WHERE reservation_seats.showtime_id = 1` would remove the rows where
+  `showtime_id` is `NULL`, which are exactly the free seats, and silently turn the LEFT JOIN into an inner join.
+- Only `active` bookings count, so a cancelled reservation frees its seats immediately.
+
+The service groups the flat rows into `rows: [{ row: "A", seats: [...] }]`, which is what a client needs to draw the map.
+
+### Step 4: route order
+
+```ts
+moviesRouter.get("/showtimes", ...);   // must come first
+moviesRouter.get("/:id", ...);
+```
+
+Express tries routes **in the order they're registered**. If `/:id` came first, `/movies/showtimes` would match it with `id = "showtimes"`
+and fail validation with a 400.
+
+### Verification (Phase 5 "done when")
+
+`npm run typecheck` passes. Seed schedule (UTC) for 2026-10-19: Hall 1 14:00, 18:00; Hall 2 15:00, 19:00.
+
+| Request | Result |
+|---------|--------|
+| `?date=2026-10-19` | ✅ 3 movies, 4 showtimes; showtime 1 has `seatsAvailable: 38` (A1 and A2 are booked), the others 40 / 24 |
+| `?date=2026-10-19&tz=Asia/Tokyo` (UTC+9) | ✅ only the 14:00Z showtime (Tokyo's day ends at 15:00 UTC) |
+| `?date=2026-10-20&tz=Asia/Tokyo` | ✅ the 15:00Z, 18:00Z and 19:00Z showtimes of the 19th + 14:00Z on the 20th |
+| `?date=2020-01-01` | ✅ 200, `movies: []` |
+| No `date` / `2026-13-45` + `tz=Mars/Olympus` | ✅ 400 / 400 with both problems |
+| `/movies/1` after adding `/movies/showtimes` | ✅ still 200 |
+| `/showtimes/1/seats` | ✅ 40 seats, 38 available, A1 and A2 taken |
+| `/showtimes/999/seats` | ✅ 404 |
+
+**The seat map changes after a reservation is inserted by hand** (row C of Hall 1, showtime 2):
+
+```
+before:            available=40  row C: · · · · · · · ·
+after booking C5:  available=39  row C: · · · · X · · ·      (schedule also says free=39)
+after cancelling:  available=40  row C: · · · · · · · ·      (active = false frees the seat)
+```
+
+### `EXPLAIN ANALYZE` results (self-check)
+
+With the seed's 64 seats, the planner reads the whole `seats` table (a *Seq Scan*), because for one tiny page
+that's cheaper than using an index. But the bookings side **already uses an index**: the partial unique index from Phase 1
+serves "which seats are taken for showtime 1":
+
+```
+Hash Left Join
+  ->  Seq Scan on seats s                Filter: (hall_id = 1)
+  ->  Bitmap Index Scan on reservation_seats_one_active_per_seat   Index Cond: (showtime_id = 1)
+```
+
+With `SET enable_seqscan = off`, which shows what the planner would do on big tables, `seats` switches to
+`Bitmap Index Scan on seats_hall_row_number_key`. That's the `UNIQUE (hall_id, row_label, seat_number)` index:
+its first column is `hall_id`, so it also serves `WHERE hall_id = 1`.
+
+The day schedule's range filter uses `Index Scan using showtimes_starts_at_idx`. The anti-pattern
+`WHERE (starts_at AT TIME ZONE 'UTC')::date = '2026-10-19'` stays a **Seq Scan even with seq scans discouraged**: there's no index on that
+expression, so it has to check every row.
+
+To repeat it: open `psql`, then run `explain analyze` followed by the query. Use `set enable_seqscan = off;` to see the index plans.
+
+### Self-check answers
+
+<details>
+<summary>Which date means "a day" for a user in Mexico City vs. one in Madrid? How does your query handle it?</summary>
+
+The same instant falls on different calendar days. 23:00 UTC on the 19th is 17:00 on the 19th in Mexico City (UTC−6), but
+01:00 on the **20th** in Madrid (UTC+2, summer time). So "the 19th" is a different 24-hour slice of UTC for each:
+Mexico City is 06:00Z → 06:00Z next day, Madrid is 22:00Z the day before → 22:00Z.
+The query turns the local date into its UTC start and end with `AT TIME ZONE` (default: the theater's zone, or `?tz=`), then filters
+`starts_at` by that range. Postgres applies each zone's daylight-saving rules, so days of 23 or 25 hours are handled.
+</details>
+
+<details>
+<summary>Run <code>EXPLAIN ANALYZE</code> on the seats query. Is it using your indexes?</summary>
+
+Partly, and that's correct. The bookings lookup uses `reservation_seats_one_active_per_seat`. The `seats` table is read with a
+Seq Scan because 64 rows fit on one page, and reading it is cheaper than an index lookup. Disabling sequential scans shows that
+`seats_hall_row_number_key` would be used on a big table. The planner chooses by estimated cost, not by "is there an index",
+so test with realistic data sizes before adding indexes.
+</details>
+
+### Try it yourself (practice)
+
+1. Add `?movie=<id>` to `/movies/showtimes` to show one movie's showtimes on that day.
+2. Insert 100,000 showtimes with `generate_series` (in a throwaway database, or reseed afterwards) and rerun the `EXPLAIN ANALYZE`
+   *without* `enable_seqscan = off`. When does the planner switch to the index?
+3. Move the `showtime_id = 1` condition from `ON` to `WHERE` in `psql` and compare the row counts.
+4. Set `THEATER_TIMEZONE=America/Mexico_City` and restart. Which date do the seeded 14:00Z showtimes now belong to? And with `Pacific/Auckland`?
+5. Add a `?date=today` shortcut. Why is "today" itself timezone-dependent?
+
+### Next: Phase 6, reservations ⭐
+
+`POST /reservations` in one transaction, letting the partial unique index reject a double booking (`23505` → 409), `GET /reservations/me`,
+cancelling (only your own, only upcoming), and the concurrency experiment: 20 simultaneous requests for one seat, exactly 1 winner.
