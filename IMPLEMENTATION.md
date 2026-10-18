@@ -10,7 +10,7 @@ the commands, the files, *why* each decision was made, and how to verify it.
 - [x] Phase 1: Data modeling
 - [x] Phase 2: Movies and genres CRUD
 - [x] Phase 3: Authentication and authorization
-- [ ] Phase 4: Showtimes and scheduling
+- [x] Phase 4: Showtimes and scheduling
 - [ ] Phase 5: Browsing and seat availability
 - [ ] Phase 6: Reservations
 - [ ] Phase 7: Admin reporting
@@ -887,7 +887,175 @@ and the signature no longer matches (tested above: 401). Only someone with the s
 4. Add `GET /users` (admin only, paginated) using `publicUserColumns` and `paginate()`.
 5. Why is `refresh_tokens.user_id` `ON DELETE CASCADE` while `reservations.user_id` is `RESTRICT`?
 
-### Next: Phase 4, showtimes and scheduling
+---
 
-Admin endpoints to create, change and remove showtimes. `ends_at` is computed from the movie's duration, an overlap in the same hall
-becomes a clean `409` (the exclusion constraint from Phase 1), and showtimes that already have reservations get rules of their own.
+## Phase 4: Showtimes and scheduling ✅
+
+**Goal:** admins can schedule, change and remove showtimes. The database stops double-booking a hall,
+and the API turns that into a clear `409`.
+
+### Files created or changed
+
+```
+src/
+├── config/env.ts                     # + CLEANING_BUFFER_MINUTES (default 15)
+├── lib/errors.ts                     # + PG_EXCLUSION_VIOLATION ("23P01")
+├── middleware/errorHandler.ts        # + safety net for 23P01
+├── db/seed.ts                        # uses computeEndsAt, so seeded showtimes include the buffer
+└── modules/showtimes/
+    ├── schedule.ts                   # computeEndsAt()
+    ├── showtimes.schemas.ts
+    ├── showtimes.service.ts
+    └── showtimes.routes.ts
+```
+
+### Endpoints
+
+| Method | Path | Auth | Success | Errors |
+|--------|------|------|---------|--------|
+| `GET` | `/showtimes/:id` | – | 200, with `movie` and `hall` | 404 |
+| `POST` | `/showtimes` | admin | 201 + `Location` | 400, 409 `HALL_BUSY` |
+| `PATCH` | `/showtimes/:id` | admin | 200 | 400, 404, 409 `HALL_BUSY` / `SHOWTIME_HAS_RESERVATIONS` / `SHOWTIME_STARTED` |
+| `DELETE` | `/showtimes/:id` | admin | 204 | 404, 409 `SHOWTIME_HAS_RESERVATIONS` |
+
+```json
+POST /showtimes
+{ "movieId": 3, "hallId": 2, "startsAt": "2026-10-19T22:00:00Z", "priceCents": 1000 }
+
+→ 201
+{ "id": 14, "startsAt": "2026-10-19T22:00:00.000Z", "endsAt": "2026-10-19T23:54:00.000Z", "priceCents": 1000,
+  "movie": { "id": 3, "title": "The Grand Budapest Hotel", "durationMinutes": 99 },
+  "hall": { "id": 2, "name": "Hall 2" } }
+```
+
+The client never sends `endsAt` (it's an unrecognized key → 400). The server computes it: 22:00 + 99 min + 15 min cleaning = 23:54.
+
+### Step 1: `ends_at` and the cleaning buffer
+
+```ts
+computeEndsAt(startsAt, durationMinutes)  // startsAt + duration + CLEANING_BUFFER_MINUTES
+```
+
+So **`ends_at` means "the hall is free again"**, not "the movie ends". The movie's own end is `startsAt + movie.durationMinutes`.
+
+Why store the buffer in `ends_at` instead of adding it inside the exclusion constraint
+(`tstzrange(starts_at, ends_at + interval '15 min')`)? Postgres only allows **IMMUTABLE** expressions in an index,
+and `timestamptz + interval` isn't. Its result depends on the session's timezone (adding "1 day" across a
+daylight-saving change isn't always 24 hours). Storing the final value keeps the constraint simple.
+
+The seed now calls the same `computeEndsAt`, so seeded and API-created showtimes follow the same rule.
+
+### Step 2: time zones in the input
+
+```ts
+startsAt: z.iso.datetime({ offset: true }).transform((value) => new Date(value))
+```
+
+- `"2026-10-19T22:00:00Z"` ✅ and `"2026-10-19T16:00:00-06:00"` ✅ (both are the same moment).
+- `"2026-10-19T22:00:00"` ❌ 400. Without a zone, "22:00" is ambiguous: 22:00 where?
+- The API always **returns UTC** (`...Z`). Showing local times is the client's job; Phase 5 deals with "which day" questions.
+
+**Past showtimes** are rejected with `400 "Must be in the future"`. That check is in the service, not in Zod, because it depends on
+*when* the request runs, not just on the shape of the input.
+
+### Step 3: overlaps are the database's job
+
+The service **doesn't** look for overlapping showtimes. It inserts, and the exclusion constraint from Phase 1 decides:
+
+```ts
+.catch(translateOverlap)   // 23P01 → 409 HALL_BUSY "Hall is busy at that time"
+```
+
+A "check first" query in the service would have the same race as in Phases 1–3: two admins could both see a free slot and
+both insert. The constraint has no gap.
+
+### Step 4: the update rules
+
+| Change | Allowed when |
+|--------|--------------|
+| `priceCents` | Always (before it starts). Existing reservations keep the price they were booked at (`reservation_seats.price_cents`). |
+| `movieId`, `hallId`, `startsAt` | Only if the showtime has **no reservations at all**. `ends_at` is recomputed. |
+| Anything | Not once the showtime has started → `409 SHOWTIME_STARTED`. |
+
+Why "no reservations at all", even cancelled ones?
+- Moving a booked showtime would silently change people's plans.
+- Changing the **hall** would break their seats: `reservation_seats` is tied to `(showtime_id, hall_id)` by the composite FK
+  from Phase 1. The database would refuse the update anyway, even for cancelled rows.
+- A cancelled reservation is still history ("you cancelled Inception at 14:00"), so it shouldn't be rewritten.
+
+**Delete** follows the same idea: only a showtime with no reservations. `reservations.showtime_id` is `ON DELETE RESTRICT`,
+so the service just translates the FK error into `409 SHOWTIME_HAS_RESERVATIONS`. (The other option in `PLAN.md`,
+"cancel them all", needs refunds and notifications. It fits better in Phase 6 or 11.)
+
+### Step 5: `SELECT ... FOR UPDATE`, the race in the update rule
+
+The update first checks "no reservations", then updates. In between, a reservation could be created, which is the classic gap again.
+This time there's no single constraint for "no reservations", so the transaction **locks the row**:
+
+```ts
+const [current] = await tx.select().from(showtimes).where(eq(showtimes.id, id)).for("update");
+```
+
+Why this is enough: when Postgres inserts a reservation, its foreign-key check takes a `FOR KEY SHARE` lock on the
+showtime row it points to, and `FOR UPDATE` conflicts with `FOR KEY SHARE`. So:
+
+- If the admin locks first, a new reservation for that showtime **waits** until the admin's transaction ends.
+- If a reservation is mid-insert, the admin's `FOR UPDATE` **waits** for it to commit, and then the count sees it.
+
+This was tested: a `psql` session inserted a reservation for showtime #15 and held its transaction open for 3 seconds.
+`PATCH /showtimes/15 { startsAt }` sent during that time **waited about 2 s**, then answered `409 SHOWTIME_HAS_RESERVATIONS`.
+Without the lock it would have moved a showtime that had just been booked.
+
+### Verification (Phase 4 "done when")
+
+`npm run typecheck` passes. Seed schedule for tomorrow: Hall 1 14:00–16:43, 18:00–19:54; Hall 2 15:00–17:20, 19:00–21:43.
+
+| Request | Result |
+|---------|--------|
+| `POST /showtimes` no token / as user | ✅ 401 / 403 |
+| **Hall 1 at 17:00 (ends 18:54, next show 18:00)** | ✅ **409 `HALL_BUSY`** |
+| Hall 2 at 22:00 | ✅ 201, `endsAt` 23:54 |
+| **Hall 1 at 22:00, same time, other hall** | ✅ **201** |
+| Hall 2 at 23:53 (1 minute before it's free) | ✅ 409 |
+| Hall 2 at 23:54 (exactly when it's free) | ✅ 201 (the `'[)'` range) |
+| `17:00-06:00` (= 23:00 UTC) in a busy Hall 1 | ✅ 409: offsets are converted correctly |
+| In the past / no timezone / unknown movie | ✅ 400 / 400 / 400 |
+| `"movieId":"1"`, `hallId: 1.5`, negative price, extra `endsAt` | ✅ 400, all five reported |
+| `GET /showtimes/1` / `999` | ✅ 200 / 404 |
+| PATCH price of #1 (has a reservation) | ✅ 200 |
+| PATCH `startsAt` of #1 | ✅ 409 `SHOWTIME_HAS_RESERVATIONS` |
+| PATCH `startsAt` / `movieId` of a free showtime | ✅ 200, `endsAt` recomputed each time |
+| PATCH #2 into Hall 2 (busy then) | ✅ 409 `HALL_BUSY` |
+| PATCH a showtime that already started | ✅ 409 `SHOWTIME_STARTED` |
+| DELETE #1 / a free one / it again | ✅ 409 / 204 / 404 |
+| PATCH during an open reservation transaction | ✅ waited ~2 s, then 409 |
+
+You may notice gaps in ids (13 and 16 were skipped). A failed insert still uses up a sequence number, because sequences
+never roll back, so that concurrent inserts don't have to wait for each other. Ids are unique, not gap-free.
+
+`requests.http` has a new Showtimes section using dates in 2030, so they don't clash with the seed.
+
+### Self-check answer
+
+<details>
+<summary>Why put the overlap check in the database, not only in the service?</summary>
+
+A service check is "SELECT overlapping showtimes, and if none, INSERT". Two admins (or two tabs) can run the SELECT at the same moment,
+both see a free hall, and both insert. The exclusion constraint is checked **inside** the insert, with the index locked, so the second insert
+fails no matter how they're timed. It also protects data written any other way: a seed script, a migration, a future
+"bulk import" endpoint, or someone in `psql`. The service still matters, but for the *message* (`409 HALL_BUSY`), not for the guarantee.
+</details>
+
+### Try it yourself (practice)
+
+1. Add `GET /halls` (public) that lists halls with their seat count. (Hint: `count()` with `groupBy`.)
+2. Set `CLEANING_BUFFER_MINUTES=0` and restart. Can you now schedule a show at 16:28 in Hall 1? Why does the seeded data not change?
+3. `POST /showtimes` with an unknown movie **and** an unknown hall reports only the movie. Change the service so it reports both.
+4. Open two `psql` sessions. In the first: `begin; select * from showtimes where id = 2 for update;`. In the second, try
+   `insert into reservations (user_id, showtime_id, total_cents) values (2, 2, 0);`. What happens? Now `commit;` the first one.
+5. A showtime is at 23:00 UTC. On which calendar day is it for a user in Mexico City (UTC-6)? And in Madrid (UTC+2)?
+
+### Next: Phase 5, browsing and seat availability
+
+`GET /movies/showtimes?date=` (movies with their showtimes on a given day) and `GET /showtimes/:id/seats` (the seat map,
+with each seat's availability).
