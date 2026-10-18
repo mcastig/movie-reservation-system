@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { reservationStatus } from "../../db/schema.ts";
+import { fromBeforeTo, fromBeforeToError, idSchema, paginationQuery, timeRangeFields } from "../../lib/schemas.ts";
 
 export const createReservationBody = z.strictObject({
   showtimeId: z.number().int().positive(),
@@ -11,4 +13,13 @@ export const createReservationBody = z.strictObject({
   // No price here: the server computes the total. Never trust a price sent by the client.
 });
 
+export const adminReservationsQuery = paginationQuery
+  .extend({
+    showtimeId: idSchema.optional(),
+    status: z.enum(reservationStatus.enumValues).optional(),
+    ...timeRangeFields,
+  })
+  .refine(fromBeforeTo, fromBeforeToError);
+
 export type CreateReservationInput = z.output<typeof createReservationBody>;
+export type AdminReservationsQuery = z.output<typeof adminReservationsQuery>;

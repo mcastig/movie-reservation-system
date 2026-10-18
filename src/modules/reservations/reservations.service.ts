@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, inArray, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lt, type SQL, sql } from "drizzle-orm";
 import { db } from "../../db/client.ts";
-import { halls, movies, reservationSeats, reservations, seats, showtimes } from "../../db/schema.ts";
+import { halls, movies, reservationSeats, reservations, seats, showtimes, users } from "../../db/schema.ts";
 import {
   ConflictError,
   isPgError,
@@ -10,7 +10,7 @@ import {
 } from "../../lib/errors.ts";
 import { type Pagination, paginate } from "../../lib/schemas.ts";
 import type { AuthUser } from "../auth/tokens.ts";
-import type { CreateReservationInput } from "./reservations.schemas.ts";
+import type { AdminReservationsQuery, CreateReservationInput } from "./reservations.schemas.ts";
 
 // --- Reading ---
 
@@ -80,6 +80,48 @@ export async function listMyReservations(user: AuthUser, page: Pagination) {
   const mine = eq(reservations.userId, user.id);
   const [data, total] = await Promise.all([findReservations(mine, page), db.$count(reservations, mine)]);
   return paginate(data, page, total);
+}
+
+// Admin view: every reservation, filtered, with who made it.
+export async function listAllReservations({ showtimeId, status, from, to, ...page }: AdminReservationsQuery) {
+  const where = and(
+    showtimeId ? eq(reservations.showtimeId, showtimeId) : undefined,
+    status ? eq(reservations.status, status) : undefined,
+    // from/to are about when the SHOW happens. $count only sees the reservations
+    // table, so the showtime filter is a subquery instead of a join.
+    from || to
+      ? inArray(
+          reservations.showtimeId,
+          db
+            .select({ id: showtimes.id })
+            .from(showtimes)
+            .where(
+              and(
+                from ? gte(showtimes.startsAt, from) : undefined,
+                to ? lt(showtimes.startsAt, to) : undefined,
+              ),
+            ),
+        )
+      : undefined,
+  );
+
+  const [data, total] = await Promise.all([findReservations(where, page), db.$count(reservations, where)]);
+
+  // Attach each reservation's user with one more query.
+  const userIds = [...new Set(data.map((r) => r.userId))];
+  const people = userIds.length
+    ? await db
+        .select({ id: users.id, name: users.name, email: users.email })
+        .from(users)
+        .where(inArray(users.id, userIds))
+    : [];
+  const byId = new Map(people.map((u) => [u.id, u]));
+
+  return paginate(
+    data.map(({ userId, ...r }) => ({ ...r, user: byId.get(userId)! })),
+    page,
+    total,
+  );
 }
 
 // --- Booking ---
