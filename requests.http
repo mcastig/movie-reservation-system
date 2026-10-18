@@ -106,6 +106,18 @@ Content-Type: application/json
 DELETE {{base}}/movies/4
 Authorization: {{admin}}
 
+### --- Browsing (public) ---
+# The seed schedules showtimes for tomorrow and the 2 days after (UTC). Change the date.
+
+### Movies with their upcoming showtimes on a day (theater timezone, default UTC)
+GET {{base}}/movies/showtimes?date=2026-10-19
+
+### Same day, as seen from Tokyo (UTC+9): a different set of showtimes
+GET {{base}}/movies/showtimes?date=2026-10-19&tz=Asia/Tokyo
+
+### Seat map of a showtime (seats A1 and A2 are taken in the seed)
+GET {{base}}/showtimes/1/seats
+
 ### --- Showtimes ---
 # Times must include a timezone: "Z" (UTC) or an offset like "-06:00".
 # The seed schedules showtimes for the next 3 days; pick a date after them.
