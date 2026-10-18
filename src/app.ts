@@ -1,5 +1,7 @@
 import express, { type Express } from "express";
+import swaggerUi from "swagger-ui-express";
 import { env } from "./config/env.ts";
+import { openApiDocument } from "./docs/openapi.ts";
 import { errorHandler, notFound } from "./middleware/errorHandler.ts";
 import { requestLogger } from "./middleware/requestLogger.ts";
 import { corsFor, type RateLimitOptions, rateLimiter, securityHeaders } from "./middleware/security.ts";
@@ -40,6 +42,12 @@ export function createApp({
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
   });
+
+  // API documentation: the raw OpenAPI JSON, and Swagger UI to explore and try it.
+  app.get("/openapi.json", (_req, res) => {
+    res.json(openApiDocument);
+  });
+  app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
 
   app.use("/auth", rateLimiter(authRateLimit), authRouter);
   app.use("/me", meRouter);

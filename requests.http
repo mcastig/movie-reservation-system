@@ -7,6 +7,9 @@
 ### Health
 GET {{base}}/health
 
+### API docs: open {{base}}/docs in a browser. The raw OpenAPI document:
+GET {{base}}/openapi.json
+
 ### --- Auth ---
 
 ### Sign up (always creates a regular user)
